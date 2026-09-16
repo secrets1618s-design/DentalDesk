@@ -136,6 +136,57 @@ def close_conversation(conversation_id: int, reason: str):
         )
         logger.debug("Conversation %s closed", conversation_id)
 
+def flag_conversation(conversation_id: int, reason: str):
+    """Marks a conversation as needing staff attention (e.g. a red-flag
+    symptom, or any question outside the bot's scope). Does NOT close the
+    conversation — the bot keeps talking to the patient (e.g. telling them
+    to call the clinic or go to the ER) while this flag lets staff know to
+    check in. See get_flagged_conversations() to review these.
+
+    If the same conversation gets flagged more than once (e.g. the patient
+    asks two different out-of-scope questions before the chat ends), each
+    new reason is appended to the existing one with a timestamp rather than
+    replacing it, so staff can see the full history of what came up.
+    """
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT flag_reason FROM conversations WHERE id=?", (conversation_id,)
+        ).fetchone()
+        existing_reason = existing["flag_reason"] if existing else None
+        timestamp = datetime.now().isoformat(timespec="minutes")
+        new_entry = f"[{timestamp}] {reason}"
+        combined_reason = f"{existing_reason}\n{new_entry}" if existing_reason else new_entry
+
+        conn.execute(
+            "UPDATE conversations SET flagged_for_staff=1, flag_reason=? WHERE id=?",
+            (combined_reason, conversation_id),
+        )
+        logger.warning("Conversation %s flagged for staff: %s", conversation_id, reason)
+
+
+def get_flagged_conversations() -> List[dict]:
+    """Returns open-or-closed conversations flagged for staff attention,
+    newest first, with the patient's name and phone number included so
+    staff can follow up."""
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                c.id as conversation_id,
+                c.status,
+                c.started_at,
+                c.flag_reason,
+                p.name as patient_name,
+                p.phone_number as patient_phone
+            FROM conversations c
+            LEFT JOIN patients p ON c.patient_id = p.id
+            WHERE c.flagged_for_staff = 1
+            ORDER BY c.started_at DESC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def add_message(conversation_id: int, sender: str, message: str) -> Message:
     with db() as conn:
         cur = conn.execute(
@@ -226,7 +277,8 @@ CREATE TABLE IF NOT EXISTS dentists (
     languages_spoken TEXT,
     qualifications TEXT,
     years_experience INTEGER,
-    availability_schedule TEXT
+    availability_schedule TEXT,
+    nationality TEXT
 );
 
 CREATE TABLE IF NOT EXISTS patients (
@@ -255,6 +307,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     started_at TEXT NOT NULL,
     ended_at TEXT,
     closed_reason TEXT,
+    flagged_for_staff INTEGER NOT NULL DEFAULT 0,
+    flag_reason TEXT,
     FOREIGN KEY(patient_id) REFERENCES patients(id)
 );
 
@@ -269,28 +323,60 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 """
 
-SEED_DENTISTS = [
-    ("Dr. Asha Rao", "Orthodontist", "English, Hindi, Kannada", "BDS, MDS", 12, "Mon-Fri 10:00-17:00"),
-    ("Dr. Ramesh Gupta", "Endodontist", "English, Hindi", "BDS, MDS", 15, "Tue-Sat 11:00-18:00"),
-    ("Dr. Meera Nair", "Pediatric Dentist", "English, Malayalam", "BDS, MDS", 10, "Mon-Thu 09:00-14:00"),
-    ("Dr. Vikram Singh", "Periodontist", "English, Hindi", "BDS, MDS", 8, "Wed-Fri 14:00-20:00"),
-    ("Dr. Shalini Desai", "Prosthodontist", "English, Gujarati", "BDS, MDS", 20, "Mon-Sat 10:00-16:00"),
-]
-
-
 def init_db(seed: bool = True):
-    """Create tables if missing, seed only if dentists table is empty."""
+    """Create tables if missing, seed only if dentists table is empty.
+
+    Dentists are seeded from config/clinic_config.yaml (edit that file to
+    change who's seeded on a fresh database) rather than a hardcoded list.
+    Note: this only runs when the dentists table is empty, so editing the
+    config file later won't update an already-seeded database — delete
+    data/dentaldesk_app.db and restart the app to re-seed from scratch.
+    """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA_SQL)
+
+        # Migration for databases created before flagged_for_staff/flag_reason
+        # existed. CREATE TABLE IF NOT EXISTS above won't add columns to an
+        # existing table, so add them here if missing. Safe to run every time:
+        # SQLite raises "duplicate column" if they're already there, and we
+        # just ignore that.
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+        if "flagged_for_staff" not in existing_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN flagged_for_staff INTEGER NOT NULL DEFAULT 0")
+            logger.info("Migrated conversations table: added flagged_for_staff column.")
+        if "flag_reason" not in existing_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN flag_reason TEXT")
+            logger.info("Migrated conversations table: added flag_reason column.")
+
+        # Same idea for dentists.nationality on databases created before it existed.
+        existing_dentist_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dentists)")}
+        if "nationality" not in existing_dentist_columns:
+            conn.execute("ALTER TABLE dentists ADD COLUMN nationality TEXT")
+            logger.info("Migrated dentists table: added nationality column.")
+
         if seed:
             existing = conn.execute("SELECT COUNT(*) FROM dentists").fetchone()[0]
             if existing == 0:
+                from shared.clinic_config import get_dentists_config
+
+                dentists = get_dentists_config()
                 conn.executemany(
-                    "INSERT INTO dentists (name, specialization, languages_spoken, qualifications, years_experience, availability_schedule) VALUES (?, ?, ?, ?, ?, ?)",
-                    SEED_DENTISTS,
+                    "INSERT INTO dentists (name, specialization, languages_spoken, qualifications, years_experience, availability_schedule, nationality) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            d.get("name"),
+                            d.get("specialization"),
+                            d.get("languages_spoken"),
+                            d.get("qualifications"),
+                            d.get("years_experience"),
+                            d.get("availability_schedule"),
+                            d.get("nationality"),
+                        )
+                        for d in dentists
+                    ],
                 )
-                logger.info("Seeded 5 dentists.")
+                logger.info("Seeded %d dentists from clinic_config.yaml.", len(dentists))
             else:
                 logger.info("Dentists already present, skipping seeding.")
 
@@ -322,6 +408,7 @@ if __name__ == "__main__":
     parser.add_argument("--list-dentists", action="store_true", help="List all dentists")
     parser.add_argument("--list-patients", action="store_true", help="List all patients")
     parser.add_argument("--list-appointments", type=int, help="List appointments for a patient_id")
+    parser.add_argument("--list-flagged", action="store_true", help="List conversations flagged for staff attention")
     parser.add_argument("--add-patient", action="store_true", help="Interactive: add a new patient")
     parser.add_argument("--book-appointment", action="store_true", help="Interactive: book an appointment")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
@@ -355,6 +442,17 @@ if __name__ == "__main__":
     if args.list_appointments:
         for appt in get_patient_appointments(args.list_appointments):
             logger.info(appt)
+
+    if args.list_flagged:
+        flagged = get_flagged_conversations()
+        if not flagged:
+            logger.info("No conversations are currently flagged for staff attention.")
+        for f in flagged:
+            logger.info(
+                "Conversation #%s | patient: %s (%s) | status: %s | started: %s | reason: %s",
+                f["conversation_id"], f["patient_name"], f["patient_phone"],
+                f["status"], f["started_at"], f["flag_reason"],
+            )
 
     if args.add_patient:
         name = input("Name: ")

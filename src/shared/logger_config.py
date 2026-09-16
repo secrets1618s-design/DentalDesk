@@ -33,8 +33,12 @@ def setup_logging(file_level=logging.DEBUG, console_level=logging.INFO):
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Create and add the file handler with its own level
-    file_handler = logging.FileHandler(log_file_path, mode='a')
+    # Create and add the file handler with its own level.
+    # encoding="utf-8" is required on Windows: without it, Python opens the
+    # log file using the system's default codepage (often cp1252), which
+    # can't represent emoji like the 👋 Sia sometimes uses in greetings and
+    # crashes with a UnicodeEncodeError the moment one gets logged.
+    file_handler = logging.FileHandler(log_file_path, mode='a', encoding="utf-8")
     file_handler.setLevel(file_level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)

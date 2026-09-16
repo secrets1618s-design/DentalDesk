@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 # Shared DB layer and Pydantic models you already created
 from shared import db as shared_db
 from shared.models import Dentist, Patient, Appointment
+from shared import clinic_config
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,32 @@ class CloseConversationPayload(BaseModel):
     conversation_id: int = Field(..., description="The ID of the conversation to close.")
     reason: str = Field("user_confirmed", description="The reason for closing the conversation.")
 
+
+class FlagForStaffPayload(BaseModel):
+    """Payload for flagging a conversation so clinic staff follow up on it."""
+    conversation_id: int = Field(..., description="The ID of the conversation to flag.")
+    reason: str = Field(..., description="A short, specific note on why this needs staff attention, e.g. 'Patient reports facial swelling and fever' or 'Patient asking about insurance coverage'.")
+
+
+class GregorianToHijriPayload(BaseModel):
+    """Payload for converting a Gregorian (standard calendar) date to Hijri."""
+    gregorian_date: str = Field(..., description="A date in YYYY-MM-DD format, e.g. '2026-09-16'.")
+
+
+class HijriToGregorianPayload(BaseModel):
+    """Payload for converting a Hijri (Islamic calendar) date to Gregorian."""
+    hijri_year: int = Field(..., description="The Hijri year, e.g. 1448.")
+    hijri_month: int = Field(..., description="The Hijri month, 1-12 (1=Muharram, 9=Ramadan, 12=Dhu al-Hijjah).")
+    hijri_day: int = Field(..., description="The Hijri day of the month, 1-30.")
+
 # endregion
+
+
+HIJRI_MONTH_NAMES = [
+    "Muharram", "Safar", "Rabi' al-awwal", "Rabi' al-thani",
+    "Jumada al-awwal", "Jumada al-thani", "Rajab", "Sha'ban",
+    "Ramadan", "Shawwal", "Dhu al-Qi'dah", "Dhu al-Hijjah",
+]
 
 
 # -------------------------
@@ -74,10 +100,15 @@ mcp = FastMCP("dentist-mcp")
 # -------------------------
 BASE_SYSTEM_PROMPT = ("You are a helpful dental assistant. Your name is 'Sia'. You can help patients book, reschedule, or cancel appointments with dentists. "
                     "You have access to the following tools. "
+                    "For any question about clinic hours, parking, phone number, holidays/closures, or the price of a service, "
+                    "you MUST call the `get_clinic_info` tool rather than guessing or making up an answer. "
                     "IMPORTANT: If the patient's name in the current state is 'New Patient', "
                     "it means they are a new user. Your first and most important task is to greet them warmly, "
-                    "introduce yourself, and ask for their full name, age, and gender to complete their registration. "
-                    "Once you have this information, you MUST use the `update_patient_profile` tool to save their details. "
+                    "introduce yourself, and ask for their full name (first AND last/family name — a single first name "
+                    "like 'Ziad' or 'Ahmed' alone is NOT enough), age, and gender to complete their registration. If the "
+                    "patient only gives a first name, politely ask for their last/family name too before proceeding — do "
+                    "not save a one-word name. Once you have their full name, age, and gender, you MUST use the "
+                    "`update_patient_profile` tool to save their details. "
                     "Do not proceed with any other request until the patient is fully registered. "
                     "After you have successfully fulfilled a user's request (like booking an appointment or answering a question), "
                     "you must always confirm with the user if there is anything else they need help with. "
@@ -87,7 +118,43 @@ BASE_SYSTEM_PROMPT = ("You are a helpful dental assistant. Your name is 'Sia'. Y
                     "from the state and set the reason to 'user_confirmed'. "
                     "VERY IMPORTANT: Before booking, cancelling, or rescheduling any appointment, you MUST call the `get_current_time` "
                     "tool to know the current date and time. All appointments must be scheduled for a future time relative to the current time. "
-                    "Do not book, cancel or reschedule appointments in the past.")
+                    "Do not book, cancel or reschedule appointments in the past.\n\n"
+                    "HIJRI DATES — if a patient gives you a date in the Hijri (Islamic) calendar (e.g. 'the 1st of Ramadan' "
+                    "or '10 Shawwal 1448') and you need the real calendar date to check availability or book/reschedule/cancel "
+                    "something, use the `convert_hijri_to_gregorian` tool — never estimate this yourself. Likewise, if a patient "
+                    "asks what a date is in the Hijri calendar, use `convert_gregorian_to_hijri`. Since these conversions are "
+                    "approximate (they can be a day off from Saudi Arabia's officially announced date, especially around "
+                    "Ramadan and Eid), mention that briefly when it matters.\n\n"
+                    "STRICTLY OUT OF SCOPE — you are a front-desk receptionist, not a clinician. You must NEVER:\n"
+                    "- Give clinical advice: never assess, diagnose, or guess the cause or severity of a symptom, never suggest "
+                    "a treatment, and never say things like 'that sounds like it could be X' or 'that's probably not serious'.\n"
+                    "- Give medication advice: never recommend, confirm, or comment on any medicine, dosage, or drug interaction "
+                    "(including over-the-counter painkillers).\n"
+                    "- Comment on test results, X-rays, or lab work.\n"
+                    "- Discuss insurance coverage or negotiate/explain billing beyond stating the plain prices from `get_clinic_info`.\n"
+                    "Whenever a patient asks about any of the above, do not guess or improvise — tell them briefly and warmly "
+                    "that a member of the clinic team will follow up with them on that, then call the `flag_for_staff` tool "
+                    "with a short, specific reason (e.g. 'Patient asking whether it's safe to take ibuprofen with their current "
+                    "medication'). Then continue the conversation normally — do not end it just because you flagged it.\n\n"
+                    "RED-FLAG EMERGENCIES — if a patient describes any of the following, treat it as urgent: severe or "
+                    "uncontrolled bleeding, facial or gum swelling especially with fever, difficulty breathing or swallowing, "
+                    "a knocked-out or badly broken tooth, a severe injury to the mouth or jaw (e.g. from an accident or fall), "
+                    "or any other symptom the patient describes as severe, worsening fast, or accompanied by fever.\n"
+                    "Do NOT hedge or soften this. Do not say things like 'if it's severe' or 'if it gets worse' — treat the "
+                    "symptom as urgent exactly as the patient described it, since you cannot judge severity yourself.\n"
+                    "Your reply MUST do all of these, in this order:\n"
+                    "1. Tell them plainly and directly, with no conditions attached, to call the clinic immediately or go to "
+                    "the nearest emergency room right now.\n"
+                    "2. Do NOT offer to book, or ask if they'd like to book, a routine appointment — a scheduled future "
+                    "appointment is the wrong response to an emergency and must not be suggested, even alongside the ER advice.\n"
+                    "3. Do NOT end this message with your usual 'is there anything else I can help you with?' — that closing "
+                    "question is for routine requests, not emergencies.\n"
+                    "4. Call `flag_for_staff` with a reason describing exactly what the patient told you, so staff follow up "
+                    "right away.\n\n"
+                    "HANDOFF — more generally, if a patient asks anything you don't have a tool for, or that clearly needs a human "
+                    "(a complaint, a special request, something confusing or ambiguous, or anything not covered by your tools), "
+                    "say so honestly, let them know staff will follow up, and call `flag_for_staff` with a short reason. Never "
+                    "pretend to handle something you can't, and never make up information you don't have a tool to confirm.")
 
 @mcp.prompt()
 def system_prompt() -> str:
@@ -127,10 +194,103 @@ def get_current_time() -> str:
     logger.debug("Tool: get_current_time, returning: %s", now)
     return now
 
+
+@mcp.tool()
+def convert_gregorian_to_hijri(payload: GregorianToHijriPayload) -> Dict[str, Any]:
+    """
+    Converts a standard (Gregorian) calendar date to the equivalent Hijri
+    (Islamic) calendar date. Use this whenever a patient asks what a date
+    is in the Hijri calendar. Never guess or calculate this yourself —
+    always call this tool.
+
+    IMPORTANT: this uses the standard mathematical (tabular) Hijri
+    calendar, which can be off by a day from Saudi Arabia's officially
+    announced date (which depends on physical moon-sighting, especially
+    around Ramadan and Eid). Mention that uncertainty to the patient for
+    anything Ramadan/Eid-related.
+    """
+    logger.debug("Tool: convert_gregorian_to_hijri, payload=%s", payload)
+    try:
+        try:
+            from hijri_converter import Gregorian
+        except ImportError:
+            from hijri_converter.convert import Gregorian
+
+        g_date = datetime.fromisoformat(payload.gregorian_date).date()
+        hijri = Gregorian(g_date.year, g_date.month, g_date.day).to_hijri()
+        month_name = HIJRI_MONTH_NAMES[hijri.month - 1]
+        return {
+            "gregorian_date": payload.gregorian_date,
+            "hijri_year": hijri.year,
+            "hijri_month": hijri.month,
+            "hijri_month_name": month_name,
+            "hijri_day": hijri.day,
+            "hijri_date_formatted": f"{hijri.day} {month_name} {hijri.year} AH",
+            "note": "Approximate — may be off by a day from Saudi Arabia's officially announced date.",
+        }
+    except Exception as e:
+        logger.error("Error in convert_gregorian_to_hijri: %s", e, exc_info=True)
+        return {"error": "conversion_failed", "details": str(e)}
+
+
+@mcp.tool()
+def convert_hijri_to_gregorian(payload: HijriToGregorianPayload) -> Dict[str, Any]:
+    """
+    Converts a Hijri (Islamic calendar) date to the equivalent standard
+    (Gregorian) calendar date. Use this whenever a patient gives you a date
+    in the Hijri calendar (e.g. "1 Ramadan" or "10 Shawwal 1448") and you
+    need the actual calendar date to check availability or book/reschedule
+    an appointment. Never guess or calculate this yourself — always call
+    this tool.
+
+    IMPORTANT: this uses the standard mathematical (tabular) Hijri
+    calendar, which can be off by a day from Saudi Arabia's officially
+    announced date (which depends on physical moon-sighting, especially
+    around Ramadan and Eid). Mention that uncertainty to the patient for
+    anything Ramadan/Eid-related.
+    """
+    logger.debug("Tool: convert_hijri_to_gregorian, payload=%s", payload)
+    try:
+        try:
+            from hijri_converter import Hijri
+        except ImportError:
+            from hijri_converter.convert import Hijri
+
+        gregorian = Hijri(payload.hijri_year, payload.hijri_month, payload.hijri_day).to_gregorian()
+        gregorian_date_str = f"{gregorian.year:04d}-{gregorian.month:02d}-{gregorian.day:02d}"
+        month_name = HIJRI_MONTH_NAMES[payload.hijri_month - 1]
+        return {
+            "hijri_date": f"{payload.hijri_day} {month_name} {payload.hijri_year} AH",
+            "gregorian_date": gregorian_date_str,
+            "note": "Approximate — may be off by a day from Saudi Arabia's officially announced date.",
+        }
+    except Exception as e:
+        logger.error("Error in convert_hijri_to_gregorian: %s", e, exc_info=True)
+        return {"error": "conversion_failed", "details": str(e)}
+
+
+@mcp.tool()
+def get_clinic_info() -> Dict[str, Any]:
+    """
+    Returns general clinic information: name, general working hours,
+    parking instructions, phone number, upcoming holidays/closures, and
+    the list of services offered with their prices (in SAR).
+    Use this to answer routine questions like "what are your hours",
+    "how much does X cost", "is there parking", or "are you open on
+    <date>" — do not guess this information, always call this tool.
+    """
+    logger.debug("Tool: get_clinic_info")
+    return {
+        **clinic_config.get_clinic_info(),
+        "services": clinic_config.get_services(),
+    }
+
+
 @mcp.tool()
 def list_dentists(specialization: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Retrieves a list of all available dentists. 
+    Retrieves a list of all available dentists, including each one's
+    nationality (when set — it may be blank for some dentists).
     You can optionally filter the list by specialization (e.g., 'Orthodontist', 'Endodontist').
     """
     logger.debug("Tool: list_dentists, specialization=%s", specialization)
@@ -147,6 +307,10 @@ def get_dentist_profile(dentist_id: Optional[int] = None, name: Optional[str] = 
     """
     Gets the detailed profile of a specific dentist, either by their unique ID or by their name.
     Providing a name will return the first dentist that matches.
+    The profile includes nationality (when set for that dentist — it may be
+    blank). Use this field to answer a patient asking a dentist's nationality
+    rather than declining — only say you don't have it if the field is
+    actually empty for that dentist.
     """
     logger.debug("Tool: get_dentist_profile, id=%s, name=%s", dentist_id, name)
     if dentist_id:
@@ -234,6 +398,14 @@ def book_appointment(payload: BookAppointmentPayload) -> Dict[str, Any]:
         if not dentist:
             return {"error": "dentist_not_found"}
 
+        # Hard safety net against booking into the past. The system prompt
+        # also tells the agent to check get_current_time and never book a
+        # past slot, but that's just an instruction the agent could in
+        # theory forget to follow — this check makes it impossible
+        # regardless, by rejecting the request at the data layer.
+        if datetime.fromisoformat(payload.appointment_time) < datetime.now():
+            return {"error": "time_in_past", "details": "That appointment time has already passed. Please choose a future date and time."}
+
         patient = _ensure_patient(
             whatsapp=payload.patient_whatsapp,
             name=payload.patient_name,
@@ -310,6 +482,13 @@ def reschedule_appointment(payload: ReschedulePayload) -> Dict[str, Any]:
     Reschedules an existing appointment to a new time. Requires the unique appointment_id.
     """
     logger.debug("Tool: reschedule_appointment, payload=%s", payload)
+
+    # Hard safety net against rescheduling into the past — see the matching
+    # comment in book_appointment for why this can't just rely on the
+    # system prompt's instruction alone.
+    if datetime.fromisoformat(payload.new_appointment_time) < datetime.now():
+        return {"error": "time_in_past", "details": "That appointment time has already passed. Please choose a future date and time."}
+
     with shared_db.db() as conn:
         appt_row = conn.execute("SELECT * FROM appointments WHERE id = ?", (payload.appointment_id,)).fetchone()
         if not appt_row or appt_row["status"] != "scheduled":
@@ -346,6 +525,29 @@ def close_conversation(payload: CloseConversationPayload) -> Dict[str, Any]:
         return {"error": "db_error", "details": str(e)}
 
 
+@mcp.tool()
+def flag_for_staff(payload: FlagForStaffPayload) -> Dict[str, Any]:
+    """
+    Flags the current conversation so clinic staff can follow up directly with
+    the patient. Use this any time you tell a patient you cannot help with
+    something and a human needs to take over — for example: symptom/emergency
+    questions, medication questions, questions about test results, insurance
+    or billing questions, complaints, or anything else outside your scope.
+    This does NOT end the conversation — keep responding normally to the
+    patient after calling it (e.g. still tell them to call the clinic or go
+    to the ER if needed). Always include a short, specific reason so staff
+    know what to follow up on.
+    """
+    logger.debug("Tool: flag_for_staff, payload=%s", payload)
+    try:
+        shared_db.flag_conversation(payload.conversation_id, payload.reason)
+        logger.warning(f"Conversation {payload.conversation_id} flagged for staff: {payload.reason}")
+        return {"status": "success", "conversation_id": payload.conversation_id}
+    except Exception as e:
+        logger.error(f"Failed to flag conversation {payload.conversation_id}: {e}", exc_info=True)
+        return {"error": "db_error", "details": str(e)}
+
+
 # -------------------------
 # Bootstrap and run
 # -------------------------
@@ -367,11 +569,18 @@ def setup_mcp_logging(level=logging.INFO):
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     )
 
-    file_handler = logging.FileHandler(log_file_path, mode='a')
+    # encoding="utf-8" avoids UnicodeEncodeError crashes on Windows when a
+    # logged message contains an emoji (the default codepage can't hold it).
+    file_handler = logging.FileHandler(log_file_path, mode='a', encoding="utf-8")
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler(sys.stdout)
+    # IMPORTANT: this server talks to its parent process over stdin/stdout
+    # (that's what "stdio transport" means for MCP). Logging to stdout would
+    # mix plain-text log lines into that same channel and corrupt the
+    # protocol, so diagnostic logging goes to stderr instead — stdout is
+    # reserved entirely for MCP protocol messages.
+    stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(formatter)
     root_logger.addHandler(stream_handler)
 

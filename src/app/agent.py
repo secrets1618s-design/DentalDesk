@@ -1,12 +1,14 @@
 import asyncio
 from datetime import datetime
 import os
+import sys
 import logging
 import json
 
 from app.whatsapp import send_message
 from shared import db
 from shared.models import Patient
+from shared.message_utils import extract_reply_text
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -21,13 +23,21 @@ from langgraph.graph import MessagesState
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 
 logger = logging.getLogger(__name__)
 
 server_params = StdioServerParameters(
-    command="uv",
-    args=["run", "dentaldesk-mcp", "--verbose"],
+    # Launch the MCP server as a module directly, using the exact same
+    # Python interpreter/environment this process is already running under
+    # (sys.executable), instead of shelling out to "uv run" again. The
+    # "uv" tool itself isn't installed inside this project's own virtual
+    # environment (only "uv sync"'s dependencies are), so re-invoking
+    # "uv" from inside here doesn't reliably work on every machine.
+    # "-m dentaldesk_mcp" runs src/dentaldesk_mcp/__main__.py directly,
+    # which does the same thing the "dentaldesk-mcp" command does.
+    command=sys.executable,
+    args=["-m", "dentaldesk_mcp", "--verbose"],
     env=None,
     cwd=os.getcwd(),
 )
@@ -48,7 +58,7 @@ async def create_graph(session):
     """
     Creates and returns the agent graph.
     The graph consists of nodes for the assistant, tool calls, and state updates.
-    The assistant node uses a ChatOpenAI model with access to the provided tools.
+    The assistant node uses a ChatAnthropic (Claude) model with access to the provided tools.
     Each conversation is tracked by a unique thread_id in the checkpointer.
     Args:
         session: The MCP client session to load tools from.
@@ -63,7 +73,11 @@ async def create_graph(session):
         "system_prompt"
     )
 
-    llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o"))
+    # Use "or" rather than getenv's built-in default: a blank
+    # ANTHROPIC_MODEL_NAME="" in the .env file (which is fine to leave
+    # blank) still counts as "set" to getenv, so its default wouldn't
+    # otherwise kick in.
+    llm = ChatAnthropic(model=os.getenv("ANTHROPIC_MODEL_NAME") or "claude-sonnet-5")
     llm_with_tools = llm.bind_tools(tools)
 
     # Graph
@@ -229,9 +243,16 @@ async def consume_messages(agent):
                                 message=json.dumps(msg.tool_calls)
                             )
                         elif msg.content:
-                            # This is the final text reply for the user
-                            db.add_message(conversation_id=conversation_id, sender="agent", message=msg.content)
-                            send_message(patient_phone_for_reply, msg.content)
+                            # This is the final text reply for the user. Claude
+                            # sometimes attaches an internal "thinking" block
+                            # alongside the answer, which turns msg.content into
+                            # a list of content blocks instead of a plain string
+                            # — extract_reply_text() pulls out just the actual
+                            # reply text so we never save/send raw block data.
+                            reply_text = extract_reply_text(msg.content)
+                            if reply_text:
+                                db.add_message(conversation_id=conversation_id, sender="agent", message=reply_text)
+                                send_message(patient_phone_for_reply, reply_text)
                     elif isinstance(msg, ToolMessage):
                         # Persist the tool result by saving its content and ID as JSON
                         tool_data = {"content": msg.content, "tool_call_id": msg.tool_call_id}
@@ -242,9 +263,10 @@ async def consume_messages(agent):
                         )
             else:
                 # Fallback for cases where no new agent messages were generated after the user's.
-                reply = response["messages"][-1].content
-                db.add_message(conversation_id=conversation_id, sender="agent", message=reply)
-                send_message(patient_phone_for_reply, reply)
+                reply = extract_reply_text(response["messages"][-1].content)
+                if reply:
+                    db.add_message(conversation_id=conversation_id, sender="agent", message=reply)
+                    send_message(patient_phone_for_reply, reply)
 
         except Exception as e:
             logger.error(f"[Agent Error] Failed to process message for conversation {conversation_id}: {e}", exc_info=True)

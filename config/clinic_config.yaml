@@ -1,0 +1,82 @@
+# ============================================================================
+# Clinic settings
+# ============================================================================
+# Edit the values below to match your real clinic. No coding needed — just
+# change the text after each colon (:) and save the file.
+#
+# Rules to keep in mind while editing:
+#   - Lines starting with # are just notes for humans and are ignored.
+#   - Keep the quotation marks " " around text values.
+#   - Keep the same indentation (spacing) as the lines around it.
+#   - After you save this file, restart the app for your changes to apply.
+# ============================================================================
+
+clinic:
+  name: "Your Clinic Name Here"
+  general_hours: "Saturday-Thursday 9:00 AM - 9:00 PM, Friday closed"
+  parking: "Free parking is available in front of the clinic."
+  phone: "+966 5X XXX XXXX"
+
+  # List any dates the clinic is fully closed (holidays, vacations, etc.)
+  # Add or remove lines as needed. Format: "YYYY-MM-DD"
+  holidays:
+    - "2026-09-23"   # Saudi National Day (example — edit/remove as needed)
+
+# ----------------------------------------------------------------------------
+# Services and prices. Add, remove, or edit lines freely — just keep each
+# service as a "- name: ... / price_sar: ..." pair like the examples below.
+# ----------------------------------------------------------------------------
+services:
+  - name: "Regular Checkup"
+    price_sar: 150
+  - name: "Teeth Cleaning"
+    price_sar: 250
+  - name: "Tooth Filling"
+    price_sar: 300
+  - name: "Root Canal Treatment"
+    price_sar: 900
+  - name: "Teeth Whitening"
+    price_sar: 700
+
+# ----------------------------------------------------------------------------
+# Dentists. This replaces the old hardcoded list — add, remove, or edit
+# dentists here instead of touching any code. These are still placeholder
+# names/details — replace them with your real dentists. "nationality" is
+# optional — remove that line for a dentist if you'd rather not share it.
+# ----------------------------------------------------------------------------
+dentists:
+  - name: "Dr. Asha Rao"
+    specialization: "Orthodontist"
+    nationality: "Indian"
+    languages_spoken: "English, Hindi, Kannada"
+    qualifications: "BDS, MDS"
+    years_experience: 12
+    availability_schedule: "Mon-Fri 10:00-17:00"
+  - name: "Dr. Ramesh Gupta"
+    specialization: "Endodontist"
+    nationality: "Indian"
+    languages_spoken: "English, Hindi"
+    qualifications: "BDS, MDS"
+    years_experience: 15
+    availability_schedule: "Tue-Sat 11:00-18:00"
+  - name: "Dr. Meera Nair"
+    specialization: "Pediatric Dentist"
+    nationality: "Indian"
+    languages_spoken: "English, Malayalam"
+    qualifications: "BDS, MDS"
+    years_experience: 10
+    availability_schedule: "Mon-Thu 09:00-14:00"
+  - name: "Dr. Vikram Singh"
+    specialization: "Periodontist"
+    nationality: "Indian"
+    languages_spoken: "English, Hindi"
+    qualifications: "BDS, MDS"
+    years_experience: 8
+    availability_schedule: "Wed-Fri 14:00-20:00"
+  - name: "Dr. Shalini Desai"
+    specialization: "Prosthodontist"
+    nationality: "Indian"
+    languages_spoken: "English, Gujarati"
+    qualifications: "BDS, MDS"
+    years_experience: 20
+    availability_schedule: "Mon-Sat 10:00-16:00"

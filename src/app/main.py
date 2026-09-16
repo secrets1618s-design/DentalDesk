@@ -18,7 +18,7 @@ def _set_env(var: str):
         os.environ[var] = getpass.getpass(f"{var}: ")
 
 # incase env vars are not set, prompt for them
-_set_env("OPENAI_API_KEY")
+_set_env("ANTHROPIC_API_KEY")
 _set_env("META_ACCESS_TOKEN")
 _set_env("META_APP_SECRET")
 _set_env("GRAPH_API_VERSION")
