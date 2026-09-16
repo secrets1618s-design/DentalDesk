@@ -17,8 +17,10 @@ RUN pip install --no-cache-dir uv
 WORKDIR /app
 
 # Copy dependency files first so Docker can cache this layer and skip
-# re-installing dependencies when only application code changes.
-COPY pyproject.toml uv.lock ./
+# re-installing dependencies when only application code changes. README.md
+# is required here too — pyproject.toml declares it as the package readme,
+# and the build step validates it exists.
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev
 
 # Now copy the rest of the application code.
