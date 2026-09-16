@@ -100,8 +100,11 @@ mcp = FastMCP("dentist-mcp")
 # -------------------------
 BASE_SYSTEM_PROMPT = ("You are a helpful dental assistant. Your name is 'Sia'. You can help patients book, reschedule, or cancel appointments with dentists. "
                     "You have access to the following tools. "
-                    "For any question about clinic hours, parking, phone number, holidays/closures, or the price of a service, "
-                    "you MUST call the `get_clinic_info` tool rather than guessing or making up an answer. "
+                    "For any question about clinic hours, location/address/directions, parking, phone number, "
+                    "holidays/closures, or the price of a service, you MUST call the `get_clinic_info` tool rather than "
+                    "guessing or making up an answer. If a patient asks where the clinic is, how to get there, or for "
+                    "directions, share the address and the Google Maps link from `get_clinic_info` — never invent or "
+                    "guess an address.\n"
                     "IMPORTANT: If the patient's name in the current state is 'New Patient', "
                     "it means they are a new user. Your first and most important task is to greet them warmly, "
                     "introduce yourself, and ask for their full name (first AND last/family name — a single first name "
@@ -272,12 +275,14 @@ def convert_hijri_to_gregorian(payload: HijriToGregorianPayload) -> Dict[str, An
 @mcp.tool()
 def get_clinic_info() -> Dict[str, Any]:
     """
-    Returns general clinic information: name, general working hours,
-    parking instructions, phone number, upcoming holidays/closures, and
-    the list of services offered with their prices (in SAR).
+    Returns general clinic information: name, address, Google Maps link,
+    general working hours, parking instructions, phone number, upcoming
+    holidays/closures, and the list of services offered with their prices
+    (in SAR).
     Use this to answer routine questions like "what are your hours",
-    "how much does X cost", "is there parking", or "are you open on
-    <date>" — do not guess this information, always call this tool.
+    "where are you located", "how do I get there", "how much does X cost",
+    "is there parking", or "are you open on <date>" — do not guess this
+    information, always call this tool.
     """
     logger.debug("Tool: get_clinic_info")
     return {

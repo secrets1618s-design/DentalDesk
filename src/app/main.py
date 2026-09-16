@@ -114,8 +114,13 @@ async def receive_webhook(request: Request, signature_valid: bool = Depends(veri
 
 def main():
     import uvicorn
-    logger.info("Starting FastAPI server...")
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("FAST_API_PORT", 8000)))
+    # Most cloud hosts (Railway, Render, Heroku, etc.) assign a port at
+    # runtime via the PORT environment variable and require the app to
+    # listen on it. Prefer that when present; otherwise fall back to
+    # FAST_API_PORT (or 8000) for local development.
+    port = int(os.environ.get("PORT") or os.environ.get("FAST_API_PORT", 8000))
+    logger.info("Starting FastAPI server on port %s...", port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

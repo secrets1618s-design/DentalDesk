@@ -17,6 +17,14 @@ clinic:
   parking: "Free parking is available in front of the clinic."
   phone: "+966 5X XXX XXXX"
 
+  # Written address shown to patients who ask where the clinic is.
+  address: "Your clinic's street address, district, city, Saudi Arabia"
+
+  # A shareable Google Maps link for the clinic. Easiest way to get one:
+  # search your clinic's location on maps.google.com, click "Share",
+  # then "Copy link", and paste it here between the quotes.
+  google_maps_link: "https://maps.google.com/?q=REPLACE_WITH_YOUR_CLINIC_LINK"
+
   # List any dates the clinic is fully closed (holidays, vacations, etc.)
   # Add or remove lines as needed. Format: "YYYY-MM-DD"
   holidays:

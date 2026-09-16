@@ -1,0 +1,29 @@
+# Never bake secrets or local-only files into the image — the cloud host
+# injects these as real environment variables at runtime instead.
+.env
+.env.*
+!example.env
+
+.venv
+.git
+.gitignore
+
+# Local data/logs shouldn't ship in the image; the host's persistent
+# volume (mounted at /app/data) is where real data lives in production.
+data/
+logs/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+
+# Local-only diagnostic scripts and scratch files (harmless to include,
+# but no reason to ship them either)
+test_send.py
+check_subscription.py
+body.json
