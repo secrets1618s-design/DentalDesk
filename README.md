@@ -49,7 +49,7 @@ Follow these instructions to get a local copy of DentalDesk up and running.
 
 - Python 3.13+
 - [uv](https://github.com/astral-sh/uv) (for environment and package management)
-- An OpenAI API Key
+- An Anthropic API Key (for Claude)
 - WhatsApp Business Account and API credentials
 
 ### Installation
@@ -71,7 +71,7 @@ Follow these instructions to get a local copy of DentalDesk up and running.
       ```sh
       cp example.env .env
       ```
-    - Edit the `.env` file to add your `OPENAI_API_KEY` and any other required credentials (like WhatsApp API tokens).
+    - Edit the `.env` file to add your `ANTHROPIC_API_KEY` and any other required credentials (like WhatsApp API tokens).
 
 ### Running the Application
 

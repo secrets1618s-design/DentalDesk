@@ -14,6 +14,7 @@ class Dentist(BaseModel):
     qualifications: Optional[str] = None
     years_experience: Optional[int] = None
     availability_schedule: Optional[str] = None
+    nationality: Optional[str] = None
 
 
 # -----------------------
