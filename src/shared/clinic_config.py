@@ -48,3 +48,33 @@ def get_services() -> List[Dict[str, Any]]:
 def get_dentists_config() -> List[Dict[str, Any]]:
     """The list of dentists defined in the config file."""
     return load_clinic_config().get("dentists", [])
+
+
+def get_offers_image_url() -> str | None:
+    """
+    Builds the full public URL for the offers/promotions brochure image
+    (served by the app as a static file from the `static/` folder), so it
+    can be sent to patients over WhatsApp — WhatsApp requires a real,
+    publicly reachable URL, not a local file path.
+
+    Returns None if there's no public base URL to build from. In
+    production on Railway this is automatic: once a public domain is
+    generated, Railway sets RAILWAY_PUBLIC_DOMAIN and this "just works".
+    For local dev (e.g. testing through ngrok), set PUBLIC_BASE_URL in
+    .env to your ngrok URL (e.g. "https://your-tunnel.ngrok-free.dev") to
+    test this feature locally — otherwise it's simply skipped locally.
+    """
+    clinic = get_clinic_info()
+    filename = clinic.get("offers_image_filename")
+    if not filename:
+        return None
+
+    base_url = os.environ.get("PUBLIC_BASE_URL")
+    if not base_url:
+        railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+        if railway_domain:
+            base_url = f"https://{railway_domain}"
+    if not base_url:
+        return None
+
+    return f"{base_url.rstrip('/')}/static/{filename}"

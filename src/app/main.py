@@ -8,6 +8,7 @@ import asyncio
 from dotenv import load_dotenv
 from shared.logger_config import setup_logging
 from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.staticfiles import StaticFiles
 from . import whatsapp as whatsapp
 from . import agent as agent_process
 
@@ -42,6 +43,16 @@ _set_env("META_VERIFY_TOKEN")
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Serves files from the static/ folder (e.g. the offers/promotions brochure
+# image) at public URLs like <your-app-url>/static/brochure.jpg — this is
+# what lets Sia send that image over WhatsApp, since WhatsApp needs a real,
+# publicly reachable URL rather than a local file path. To change the
+# brochure, just replace static/brochure.jpg (see config/clinic_config.yaml).
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 @app.on_event("startup")
 async def startup_event():

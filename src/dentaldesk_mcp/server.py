@@ -62,6 +62,11 @@ class CloseConversationPayload(BaseModel):
     reason: str = Field("user_confirmed", description="The reason for closing the conversation.")
 
 
+class SendOffersBrochurePayload(BaseModel):
+    """Payload for sending the clinic's offers/promotions brochure image to a patient."""
+    patient_whatsapp: str = Field(..., description="The patient's WhatsApp number to send the brochure image to.")
+
+
 class FlagForStaffPayload(BaseModel):
     """Payload for flagging a conversation so clinic staff follow up on it."""
     conversation_id: int = Field(..., description="The ID of the conversation to flag.")
@@ -105,6 +110,11 @@ BASE_SYSTEM_PROMPT = ("You are a helpful dental assistant. Your name is 'Sia'. Y
                     "guessing or making up an answer. If a patient asks where the clinic is, how to get there, or for "
                     "directions, share the address and the Google Maps link from `get_clinic_info` — never invent or "
                     "guess an address.\n"
+                    "If a patient asks about current offers, promotions, discounts, or deals, use the "
+                    "`send_offers_brochure` tool (with the patient's WhatsApp number from the current state) to send "
+                    "them the brochure image directly — do not try to describe offers in detail yourself. If that tool "
+                    "returns an error, let the patient know the brochure isn't available right now and a staff member "
+                    "can share the current offers with them.\n"
                     "IMPORTANT: If the patient's name in the current state is 'New Patient', "
                     "it means they are a new user. Your first and most important task is to greet them warmly, "
                     "introduce yourself, and ask for their full name (first AND last/family name — a single first name "
@@ -289,6 +299,36 @@ def get_clinic_info() -> Dict[str, Any]:
         **clinic_config.get_clinic_info(),
         "services": clinic_config.get_services(),
     }
+
+
+@mcp.tool()
+def send_offers_brochure(payload: SendOffersBrochurePayload) -> Dict[str, Any]:
+    """
+    Sends the clinic's current offers/promotions brochure image directly to
+    the patient over WhatsApp. Use this whenever a patient asks about
+    current offers, promotions, discounts, or deals — send the image
+    rather than trying to describe offers yourself in detail.
+    """
+    logger.debug("Tool: send_offers_brochure, payload=%s", payload)
+    try:
+        # Imported here (not at module load time) since this MCP server
+        # process only needs it for this one tool, and to avoid loading the
+        # FastAPI app's dependencies for every other tool call.
+        from app.whatsapp import send_image_message
+
+        image_url = clinic_config.get_offers_image_url()
+        if not image_url:
+            return {
+                "error": "brochure_not_available",
+                "details": "No public URL is configured for the brochure image right now.",
+            }
+
+        caption = clinic_config.get_clinic_info().get("offers_text") or None
+        send_image_message(payload.patient_whatsapp, image_url, caption=caption)
+        return {"status": "sent"}
+    except Exception as e:
+        logger.error("Error in send_offers_brochure: %s", e, exc_info=True)
+        return {"error": "send_failed", "details": str(e)}
 
 
 @mcp.tool()

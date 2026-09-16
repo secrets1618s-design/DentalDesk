@@ -104,6 +104,49 @@ def send_message(phone_number, message):
         return response
 
 
+def send_image_message(phone_number, image_url, caption=None):
+    """
+    Sends an image message (e.g. the offers/promotions brochure) to a
+    patient over WhatsApp. `image_url` must be a real, publicly reachable
+    URL — WhatsApp fetches the image from it directly, it cannot be a
+    local file path.
+    """
+    image_payload = {"link": image_url}
+    if caption:
+        image_payload["caption"] = caption
+
+    data = json.dumps({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": phone_number,
+            "type": "image",
+            "image": image_payload,
+        })
+
+    headers = {
+        "Content-type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('META_ACCESS_TOKEN')}",
+    }
+
+    api_version = os.environ.get("GRAPH_API_VERSION")
+    phone_id = os.environ.get("META_PHONE_NUMBER_ID")
+    url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
+
+    try:
+        response = requests.post(url, data=data, headers=headers)
+        response.raise_for_status()
+    except requests.Timeout:
+        logger.error("Whatsapp send image message request timed out")
+        raise HTTPException(status_code=408, detail="Request Timeout")
+    except requests.RequestException as e:
+        logger.error(f"Internal Server Error, failed to send image message : {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error, failed to send image message")
+    else:
+        logger.debug(f"send_image_message - status: {response.status_code}")
+        logger.info(f"Outgoing image to {phone_number}: {image_url}")
+        return response
+
+
 def format_message_content(text: str) -> str:
     """
     Cleans and converts input text into WhatsApp-compatible formatting.
