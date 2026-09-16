@@ -3,6 +3,7 @@ import json
 import hmac
 import hashlib
 import os, getpass
+import sys
 import asyncio
 from dotenv import load_dotenv
 from shared.logger_config import setup_logging
@@ -14,10 +15,22 @@ load_dotenv()
 setup_logging()
 
 def _set_env(var: str):
-    if not os.environ.get(var):
+    if os.environ.get(var):
+        return
+    if sys.stdin is not None and sys.stdin.isatty():
+        # Running interactively (e.g. a developer's own terminal) with the
+        # variable missing from .env — prompt for it, same as before.
         os.environ[var] = getpass.getpass(f"{var}: ")
+    else:
+        # Running non-interactively (a cloud host, a background process) —
+        # there's no one to answer a prompt, so getpass would just hang
+        # forever with no explanation. Fail fast with a clear error instead.
+        raise RuntimeError(
+            f"Required environment variable '{var}' is not set. Set it in your "
+            "hosting platform's environment variables (or in .env for local runs)."
+        )
 
-# incase env vars are not set, prompt for them
+# incase env vars are not set, prompt for them (only when running interactively)
 _set_env("ANTHROPIC_API_KEY")
 _set_env("META_ACCESS_TOKEN")
 _set_env("META_APP_SECRET")
