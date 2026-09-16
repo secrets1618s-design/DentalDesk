@@ -35,6 +35,8 @@ clinic:
 # service as a "- name: ... / price_sar: ..." pair like the examples below.
 # ----------------------------------------------------------------------------
 services:
+  - name: "Consultation / Visit Fee"
+    price_sar: 300
   - name: "Regular Checkup"
     price_sar: 150
   - name: "Teeth Cleaning"
