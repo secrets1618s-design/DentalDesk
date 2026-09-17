@@ -117,7 +117,11 @@ async def receive_webhook(request: Request, signature_valid: bool = Depends(veri
     # Respond to status updates (like message delivered, read etc.)
     if whatsapp.is_status_update(body):
         status = whatsapp.parse_status_update(body)
-        logger.debug(f"Received a WhatsApp status update event. status = {status.get('status')}")
+        # Logged at INFO (not debug) and with the full status object --
+        # temporary/diagnostic-friendly change so delivery failures (which
+        # include an "errors" field with the real reason) show up in
+        # Railway's log viewer without digging through debug-level noise.
+        logger.info(f"WhatsApp status update: {status}")
         return {"status": "ok"}
 
     try:
