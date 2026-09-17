@@ -132,9 +132,17 @@ async def receive_webhook(request: Request, signature_valid: bool = Depends(veri
 
             return {"status": "ok"}
         else:
-            logger.error("Invalid WhatsApp message structure")
-            raise HTTPException(status_code=404, detail="Invalid WhatsApp message structure")
-        
+            # Not a text message we recognize (could be a reaction, a
+            # template-quality/webhook-test ping, a read receipt shape we
+            # don't otherwise catch, etc). Log the full body at INFO so we
+            # can see exactly what it was, but respond 200 OK -- returning
+            # an error here for event types we simply don't act on yet is
+            # what was causing Meta to see repeated failed webhook
+            # deliveries, which risks Meta throttling/disabling the
+            # webhook subscription entirely. Always acknowledge safely.
+            logger.info(f"Unhandled webhook event (not a text message or status update): {body}")
+            return {"status": "ok"}
+
     except Exception as e:
         logger.error(f"Error processing message: {e}")
         raise HTTPException(status_code=400, detail="Error processing message")

@@ -25,6 +25,16 @@ clinic:
   # then "Copy link", and paste it here between the quotes.
   google_maps_link: "https://maps.google.com/?q=REPLACE_WITH_YOUR_CLINIC_LINK"
 
+  # A short caption describing your current offers/promotions. Sia sends
+  # this alongside the brochure image whenever a patient asks about offers.
+  offers_text: "Ask our staff about our current promotions!"
+
+  # The brochure/offers image file. This is currently a SAMPLE placeholder
+  # image (static/brochure.jpg) — replace that file with your own offers
+  # image (keep the same filename, or change it here) to make Sia send your
+  # real brochure instead of the sample.
+  offers_image_filename: "brochure.jpg"
+
   # List any dates the clinic is fully closed (holidays, vacations, etc.)
   # Add or remove lines as needed. Format: "YYYY-MM-DD"
   holidays:
