@@ -16,7 +16,18 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = os.path.join(
+# Multi-clinic support: each clinic's MCP tool process is launched (see
+# app/agent.py's ClinicWorker) with CLINIC_CONFIG_PATH set in its own
+# environment, pointing at that one clinic's own clinic_config.yaml file
+# (written by the Add Clinic admin page into data/clinics/<slug>/). Since
+# each clinic gets its own separate OS process for this, reading a plain
+# environment variable here is safe -- unlike shared/db.py, this module is
+# never called from the main multi-clinic FastAPI process, only from
+# inside a single clinic's own MCP subprocess, so no contextvars are
+# needed. Falls back to the original single-clinic path when unset, which
+# is what keeps local development and any non-migrated deployment working
+# exactly as before.
+CONFIG_PATH = os.environ.get("CLINIC_CONFIG_PATH") or os.path.join(
     os.path.dirname(__file__), "..", "..", "config", "clinic_config.yaml"
 )
 
@@ -77,4 +88,12 @@ def get_offers_image_url() -> str | None:
     if not base_url:
         return None
 
-    return f"{base_url.rstrip('/')}/static/{filename}"
+    # Legacy single-clinic deployments serve from /static (see app/main.py's
+    # original StaticFiles mount). A clinic added through the Add Clinic
+    # admin page instead has its own uploads folder, served at its own URL
+    # prefix -- CLINIC_STATIC_URL_PREFIX is set in that clinic's MCP
+    # subprocess environment (see app/agent.py) to something like
+    # "/clinic-static/<slug>" so its brochure image doesn't collide with
+    # any other clinic's file of the same name.
+    url_prefix = os.environ.get("CLINIC_STATIC_URL_PREFIX", "/static")
+    return f"{base_url.rstrip('/')}{url_prefix.rstrip('/')}/{filename}"

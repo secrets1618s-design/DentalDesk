@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import logging
+import contextvars
 from contextlib import contextmanager
 from typing import List, Optional
 from datetime import datetime
@@ -9,13 +10,47 @@ from shared.models import Dentist, Patient, Appointment, Message, Conversation, 
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "../..", "data", "dentaldesk_app.db")
-logger.info("Using DB at: %s", DB_PATH)
+# The default (legacy, single-clinic) database file -- used whenever no
+# per-clinic path has been set below. Kept exactly as before so nothing
+# changes for the one clinic that predates the multi-clinic feature.
+_DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "../..", "data", "dentaldesk_app.db")
+
+# Multi-clinic support: this one running app now handles several clinics at
+# once, each with its own separate database file (see shared/clinics_store.py).
+# The MCP tool subprocess is one separate OS process per clinic, so it can
+# just read CLINIC_DB_PATH from its own environment. But shared/db.py is
+# ALSO called directly from app/agent.py, which runs ALL clinics' background
+# tasks together inside the ONE FastAPI process -- there, a plain
+# environment variable would be shared (and wrong) across clinics running
+# concurrently. A contextvars.ContextVar solves this: each asyncio task
+# gets its own independent copy, so one clinic's task setting this never
+# affects another clinic's task running at the same time, while everything
+# awaited from within that task (including this module's own functions)
+# still sees the value that task set.
+_current_db_path: contextvars.ContextVar = contextvars.ContextVar("current_db_path", default=None)
+
+
+def set_current_db_path(path: str) -> None:
+    """Call this once at the start of a clinic's background task (see
+    app/agent.py's ClinicWorker.run) so every db.* call made from within
+    that task -- and everything it awaits -- reads/writes that clinic's own
+    database file instead of the shared default."""
+    _current_db_path.set(path)
+
+
+def get_db_path() -> str:
+    return (
+        _current_db_path.get()
+        or os.environ.get("CLINIC_DB_PATH")
+        or _DEFAULT_DB_PATH
+    )
 
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    path = get_db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -323,16 +358,23 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 """
 
-def init_db(seed: bool = True):
+def init_db(seed: bool = True, dentists: Optional[list] = None):
     """Create tables if missing, seed only if dentists table is empty.
 
-    Dentists are seeded from config/clinic_config.yaml (edit that file to
-    change who's seeded on a fresh database) rather than a hardcoded list.
+    By default, dentists are seeded from clinic_config.get_dentists_config()
+    (which reads config/clinic_config.yaml, or that clinic's own copy of it
+    for a clinic added through the Add Clinic admin page). Pass `dentists`
+    explicitly (a list of dicts, same shape as clinic_config.yaml's
+    `dentists:` entries) to seed from an in-memory list instead, without
+    touching any file -- this is what a clinic's ClinicWorker does, since
+    its dentists list already lives in the clinics_store row.
+
     Note: this only runs when the dentists table is empty, so editing the
-    config file later won't update an already-seeded database — delete
-    data/dentaldesk_app.db and restart the app to re-seed from scratch.
+    config later won't update an already-seeded database -- delete that
+    clinic's database file and restart the app to re-seed from scratch.
     """
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    path = get_db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA_SQL)
 
@@ -358,9 +400,10 @@ def init_db(seed: bool = True):
         if seed:
             existing = conn.execute("SELECT COUNT(*) FROM dentists").fetchone()[0]
             if existing == 0:
-                from shared.clinic_config import get_dentists_config
+                if dentists is None:
+                    from shared.clinic_config import get_dentists_config
+                    dentists = get_dentists_config()
 
-                dentists = get_dentists_config()
                 conn.executemany(
                     "INSERT INTO dentists (name, specialization, languages_spoken, qualifications, years_experience, availability_schedule, nationality) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [
@@ -376,17 +419,18 @@ def init_db(seed: bool = True):
                         for d in dentists
                     ],
                 )
-                logger.info("Seeded %d dentists from clinic_config.yaml.", len(dentists))
+                logger.info("Seeded %d dentists into %s.", len(dentists), path)
             else:
                 logger.info("Dentists already present, skipping seeding.")
 
 
 def clean_db():
-    if os.path.exists(DB_PATH):
-        confirm = input(f"⚠️ Are you sure you want to delete {DB_PATH}? (y/N): ")
+    path = get_db_path()
+    if os.path.exists(path):
+        confirm = input(f"⚠️ Are you sure you want to delete {path}? (y/N): ")
         if confirm.lower() == "y":
-            os.remove(DB_PATH)
-            logger.warning("Database deleted: %s", DB_PATH)
+            os.remove(path)
+            logger.warning("Database deleted: %s", path)
         else:
             logger.info("Cancelled database deletion.")
     else:
@@ -424,7 +468,7 @@ if __name__ == "__main__":
 
     if args.init:
         init_db(seed=True)
-        logger.info("Database initialized at: %s", DB_PATH)
+        logger.info("Database initialized at: %s", get_db_path())
 
     if args.clean:
         clean_db()

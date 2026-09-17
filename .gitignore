@@ -74,5 +74,7 @@ Thumbs.db
 
 # Project-specific ignores
 data/dentaldesk_app.db*
+data/control.db*
+data/clinics/
 logs/
 .gemini/

@@ -16,6 +16,8 @@ dependencies = [
     "pydantic>=2.11.7",
     "requests>=2.32.4",
     "uvicorn>=0.35.0",
+    "pyyaml>=6.0",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]

@@ -77,6 +77,22 @@ def get_message_sender(body):
         return None
 
 
+def get_receiving_phone_number_id(body):
+    """
+    Extracts the WhatsApp Business phone_number_id this event was sent TO
+    (not the patient's own number) from a webhook event's metadata --
+    present on both message and status-update events. This is what lets
+    ONE shared /webhook endpoint tell multiple clinics' numbers apart: each
+    clinic's WhatsApp number has a different phone_number_id, and every
+    incoming event says which one it arrived on.
+    Returns None if it can't be found.
+    """
+    try:
+        return body["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"]
+    except Exception:
+        return None
+
+
 def parse_phone_and_message(body):
     """
     Parse the phone number and message body from the WhatsApp webhook event.
@@ -94,7 +110,18 @@ def parse_phone_and_message(body):
         raise HTTPException(status_code=400, detail="Invalid WhatsApp message structure")
 
 
-def send_message(phone_number, message):
+def send_message(phone_number, message, access_token=None, phone_number_id=None, api_version=None):
+    """
+    Sends a plain text WhatsApp message.
+
+    access_token / phone_number_id / api_version let a caller send on
+    behalf of a SPECIFIC clinic (needed now that one running app can serve
+    several clinics, each with their own WhatsApp number/token) -- when
+    omitted, this falls back to the single-clinic environment variables,
+    exactly as before, which is what the per-clinic MCP tool subprocess
+    still relies on (it always has exactly one clinic's credentials in its
+    own environment already).
+    """
     message = format_message_content(message)
     data = json.dumps({
             "messaging_product": "whatsapp",
@@ -106,11 +133,11 @@ def send_message(phone_number, message):
 
     headers = {
         "Content-type": "application/json",
-        "Authorization": f"Bearer {os.environ.get('META_ACCESS_TOKEN')}",
+        "Authorization": f"Bearer {access_token or os.environ.get('META_ACCESS_TOKEN')}",
     }
 
-    api_version = os.environ.get("GRAPH_API_VERSION")
-    phone_id = os.environ.get("META_PHONE_NUMBER_ID")
+    api_version = api_version or os.environ.get("GRAPH_API_VERSION")
+    phone_id = phone_number_id or os.environ.get("META_PHONE_NUMBER_ID")
     url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
 
     try:
@@ -135,12 +162,15 @@ def send_message(phone_number, message):
         return response
 
 
-def send_image_message(phone_number, image_url, caption=None):
+def send_image_message(phone_number, image_url, caption=None, access_token=None, phone_number_id=None, api_version=None):
     """
     Sends an image message (e.g. the offers/promotions brochure) to a
     patient over WhatsApp. `image_url` must be a real, publicly reachable
     URL — WhatsApp fetches the image from it directly, it cannot be a
     local file path.
+
+    See send_message() above for why access_token / phone_number_id /
+    api_version exist and when to pass them.
     """
     image_payload = {"link": image_url}
     if caption:
@@ -156,11 +186,11 @@ def send_image_message(phone_number, image_url, caption=None):
 
     headers = {
         "Content-type": "application/json",
-        "Authorization": f"Bearer {os.environ.get('META_ACCESS_TOKEN')}",
+        "Authorization": f"Bearer {access_token or os.environ.get('META_ACCESS_TOKEN')}",
     }
 
-    api_version = os.environ.get("GRAPH_API_VERSION")
-    phone_id = os.environ.get("META_PHONE_NUMBER_ID")
+    api_version = api_version or os.environ.get("GRAPH_API_VERSION")
+    phone_id = phone_number_id or os.environ.get("META_PHONE_NUMBER_ID")
     url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
 
     try:

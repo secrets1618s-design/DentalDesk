@@ -1,0 +1,393 @@
+"""
+The "Add Clinic" admin page.
+
+This is the whole point of the multi-clinic feature: instead of a new
+Railway service, a git branch, or a separate app for every clinic, adding
+a clinic is filling in this one form and clicking Save. On submit, this:
+
+  1. Saves the clinic's details (hours, address, services, dentists,
+     offers brochure) and its WhatsApp credentials into the clinics store.
+  2. Subscribes that clinic's WhatsApp Business Account to this same app,
+     so Meta starts sending its messages to this same running service.
+  3. Starts that clinic's own background worker immediately, in this same
+     running process -- no restart, no redeploy, no new Railway service.
+
+The one thing this page CANNOT do for you is the Meta-side setup that has
+to happen in Meta's own dashboard first: verifying the clinic's phone
+number and creating a System User access token for it. See
+claude/how-to-add-remove-clinic-whatsapp-number.md for that part -- once
+you have that phone number ID, WABA ID, and access token in hand, this
+page does everything else.
+
+Protected with a simple username/password (HTTP Basic Auth) set via the
+ADMIN_USERNAME / ADMIN_PASSWORD environment variables, so this isn't left
+open to the public internet.
+"""
+import os
+import re
+import html
+import logging
+import secrets as _secrets
+from datetime import datetime
+from typing import Optional
+
+import requests
+from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+from shared import clinics_store
+from app.clinic_registry import launch_clinic_worker
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+security = HTTPBasic()
+
+SUBSCRIPTION_PLAN_CHOICES = ["trial", "1_month", "3_months", "6_months", "12_months"]
+
+
+def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = os.environ.get("ADMIN_USERNAME", "admin")
+    correct_password = os.environ.get("ADMIN_PASSWORD")
+    if not correct_password:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_PASSWORD is not set on this deployment -- set it in Railway's Variables tab before using /admin/clinics.",
+        )
+    username_ok = _secrets.compare_digest(credentials.username, correct_username)
+    password_ok = _secrets.compare_digest(credentials.password, correct_password)
+    if not (username_ok and password_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return True
+
+
+# -------------------------
+# Small text-based parsers for the form's textarea fields. Keeping these as
+# plain "one thing per line, parts separated by |" rather than a JSON blob
+# is deliberate -- it's the format a non-developer can type directly, the
+# same spirit as clinic_config.yaml's existing services/dentists lists.
+# -------------------------
+def _parse_services(text: str):
+    services = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        name, price = parts[0], parts[1]
+        try:
+            price_val = int(price)
+        except ValueError:
+            try:
+                price_val = float(price)
+            except ValueError:
+                price_val = price
+        services.append({"name": name, "price_sar": price_val})
+    return services
+
+
+def _parse_dentists(text: str):
+    dentists = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        parts += [""] * (7 - len(parts))
+        name, specialization, nationality, languages, qualifications, years, availability = parts[:7]
+        if not name:
+            continue
+        dentists.append({
+            "name": name,
+            "specialization": specialization,
+            "nationality": nationality or None,
+            "languages_spoken": languages,
+            "qualifications": qualifications,
+            "years_experience": int(years) if years.isdigit() else None,
+            "availability_schedule": availability,
+        })
+    return dentists
+
+
+def _parse_holidays(text: str):
+    return [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+
+def _subscribe_waba(waba_id: str, access_token: str) -> dict:
+    """Tells Meta to start sending this WABA's WhatsApp messages to this
+    app (i.e. to this same running service) -- the one Graph API call that
+    replaces what used to require a whole new Railway service."""
+    api_version = os.environ.get("GRAPH_API_VERSION", "v25.0")
+    url = f"https://graph.facebook.com/{api_version}/{waba_id}/subscribed_apps"
+    try:
+        resp = requests.post(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {"raw": resp.text}
+        return {"ok": resp.ok, "status_code": resp.status_code, "body": body}
+    except requests.RequestException as e:
+        return {"ok": False, "status_code": None, "body": {"error": str(e)}}
+
+
+# -------------------------
+# HTML rendering (plain server-rendered HTML, no build step, no JS
+# framework -- kept simple on purpose since this is an internal tool)
+# -------------------------
+PAGE_STYLE = """
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 18px; margin-top: 36px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }
+  th { background: #f7f7f7; }
+  form { margin-top: 12px; }
+  label { display: block; font-weight: 600; margin-top: 14px; font-size: 14px; }
+  .hint { color: #666; font-weight: 400; font-size: 12px; display: block; margin-top: 2px; }
+  input[type=text], input[type=date], select, textarea { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; }
+  textarea { font-family: monospace; }
+  .row { display: flex; gap: 16px; }
+  .row > div { flex: 1; }
+  button { margin-top: 20px; padding: 10px 18px; font-size: 15px; background: #1a7f37; color: white; border: none; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #166a2e; }
+  .flash-ok { background: #e6ffed; border: 1px solid #1a7f37; padding: 10px; border-radius: 4px; margin-top: 12px; }
+  .flash-err { background: #ffeef0; border: 1px solid #cf222e; padding: 10px; border-radius: 4px; margin-top: 12px; white-space: pre-wrap; }
+  .badge-active { color: #1a7f37; font-weight: 600; }
+  .badge-inactive { color: #999; }
+</style>
+"""
+
+
+def _render_page(message_html: str = "") -> str:
+    clinics = clinics_store.list_clinics()
+
+    rows = ""
+    if clinics:
+        for c in clinics:
+            rows += f"""
+            <tr>
+                <td>{html.escape(c['name'])}</td>
+                <td>{html.escape(c['slug'])}</td>
+                <td>{html.escape(c['whatsapp_phone_number_id'])}</td>
+                <td>{html.escape(c['subscription_plan'])} (since {html.escape(c['subscription_started_at'])})</td>
+                <td class="{'badge-active' if c['active'] else 'badge-inactive'}">{'active' if c['active'] else 'inactive'}</td>
+            </tr>"""
+    else:
+        rows = "<tr><td colspan=5>No clinics yet -- add the first one below.</td></tr>"
+
+    plan_options = "".join(
+        f'<option value="{p}">{p.replace("_", " ")}</option>' for p in SUBSCRIPTION_PLAN_CHOICES
+    )
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    return f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Mawaid — Clinics</title>{PAGE_STYLE}</head>
+<body>
+  <h1>🦷 Mawaid — Clinics running on this service</h1>
+  {message_html}
+
+  <h2>Current clinics</h2>
+  <table>
+    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Status</th></tr>
+    {rows}
+  </table>
+
+  <h2>Add a new clinic</h2>
+  <p class="hint">
+    Before filling this in, you need three things from Meta's dashboard for this clinic's WhatsApp number:
+    the <b>WhatsApp Business Account (WABA) ID</b>, the <b>Phone Number ID</b>, and a <b>permanent access token</b>
+    (a System User token) -- see claude/how-to-add-remove-clinic-whatsapp-number.md for exactly how to get those.
+    Everything else below is filled in by you, once, right here.
+  </p>
+  <form method="post" action="/admin/clinics/add" enctype="multipart/form-data">
+
+    <label>Clinic name
+      <input type="text" name="name" required placeholder="Al Waha Dental Clinic">
+    </label>
+
+    <div class="row">
+      <div>
+        <label>WhatsApp Access Token (System User token)
+          <input type="text" name="whatsapp_access_token" required>
+        </label>
+      </div>
+      <div>
+        <label>WhatsApp Phone Number ID
+          <input type="text" name="whatsapp_phone_number_id" required>
+        </label>
+      </div>
+      <div>
+        <label>WhatsApp Business Account (WABA) ID
+          <input type="text" name="whatsapp_waba_id" required>
+        </label>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>General hours
+          <input type="text" name="general_hours" placeholder="Saturday-Thursday 9:00 AM - 9:00 PM, Friday closed">
+        </label>
+      </div>
+      <div>
+        <label>Parking
+          <input type="text" name="parking" placeholder="Free parking is available in front of the clinic.">
+        </label>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Clinic phone number
+          <input type="text" name="phone" placeholder="+966 5X XXX XXXX">
+        </label>
+      </div>
+      <div>
+        <label>Google Maps link
+          <input type="text" name="google_maps_link" placeholder="https://maps.google.com/?q=...">
+        </label>
+      </div>
+    </div>
+
+    <label>Address
+      <input type="text" name="address" placeholder="Street, district, city, Saudi Arabia">
+    </label>
+
+    <label>Offers/promotions caption
+      <span class="hint">Sent alongside the brochure image when a patient asks about offers.</span>
+      <input type="text" name="offers_text" placeholder="Ask our staff about our current promotions!">
+    </label>
+
+    <label>Brochure/offers image (optional)
+      <span class="hint">Upload the image to send when a patient asks about offers/promotions. Leave empty to add it later.</span>
+      <input type="file" name="offers_image" accept="image/*">
+    </label>
+
+    <label>Holidays / closures
+      <span class="hint">One date per line, format YYYY-MM-DD. Leave blank if none.</span>
+      <textarea name="holidays" rows="2" placeholder="2026-09-23"></textarea>
+    </label>
+
+    <label>Services and prices
+      <span class="hint">One per line: Name | Price in SAR. Example: Teeth Cleaning | 250</span>
+      <textarea name="services" rows="6" placeholder="Consultation / Visit Fee | 300&#10;Regular Checkup | 150&#10;Teeth Cleaning | 250"></textarea>
+    </label>
+
+    <label>Dentists
+      <span class="hint">One per line: Name | Specialization | Nationality | Languages | Qualifications | Years experience | Availability.
+      Nationality can be left blank (just leave that spot empty between the | |).
+      Example: Dr. Asha Rao | Orthodontist | Indian | English, Hindi | BDS, MDS | 12 | Mon-Fri 10:00-17:00</span>
+      <textarea name="dentists" rows="6" placeholder="Dr. Asha Rao | Orthodontist | Indian | English, Hindi | BDS, MDS | 12 | Mon-Fri 10:00-17:00"></textarea>
+    </label>
+
+    <div class="row">
+      <div>
+        <label>Subscription plan
+          <select name="subscription_plan">{plan_options}</select>
+        </label>
+      </div>
+      <div>
+        <label>Subscription/trial start date
+          <input type="date" name="subscription_started_at" value="{today}">
+        </label>
+      </div>
+    </div>
+
+    <button type="submit">Save and bring this clinic online</button>
+  </form>
+</body>
+</html>"""
+
+
+@router.get("/admin/clinics", response_class=HTMLResponse)
+async def admin_clinics_page(_: bool = Depends(require_admin)):
+    return _render_page()
+
+
+@router.post("/admin/clinics/add", response_class=HTMLResponse)
+async def admin_add_clinic(
+    _: bool = Depends(require_admin),
+    name: str = Form(...),
+    whatsapp_access_token: str = Form(...),
+    whatsapp_phone_number_id: str = Form(...),
+    whatsapp_waba_id: str = Form(...),
+    general_hours: str = Form(""),
+    parking: str = Form(""),
+    phone: str = Form(""),
+    address: str = Form(""),
+    google_maps_link: str = Form(""),
+    offers_text: str = Form(""),
+    holidays: str = Form(""),
+    services: str = Form(""),
+    dentists: str = Form(""),
+    subscription_plan: str = Form("trial"),
+    subscription_started_at: str = Form(""),
+    offers_image: Optional[UploadFile] = File(None),
+):
+    existing = clinics_store.get_clinic_by_phone_number_id(whatsapp_phone_number_id.strip())
+    if existing:
+        message = f'<div class="flash-err">A clinic is already registered with WhatsApp Phone Number ID {html.escape(whatsapp_phone_number_id)} (clinic: {html.escape(existing["name"])}). Nothing was added.</div>'
+        return HTMLResponse(_render_page(message))
+
+    clinic = clinics_store.add_clinic(
+        name=name.strip(),
+        whatsapp_access_token=whatsapp_access_token.strip(),
+        whatsapp_phone_number_id=whatsapp_phone_number_id.strip(),
+        whatsapp_waba_id=whatsapp_waba_id.strip(),
+        general_hours=general_hours.strip(),
+        parking=parking.strip(),
+        phone=phone.strip(),
+        address=address.strip(),
+        google_maps_link=google_maps_link.strip(),
+        offers_text=offers_text.strip(),
+        holidays=_parse_holidays(holidays),
+        services=_parse_services(services),
+        dentists=_parse_dentists(dentists),
+        subscription_plan=subscription_plan,
+        subscription_started_at=subscription_started_at or None,
+    )
+
+    # Save the uploaded brochure image (if any) into this clinic's own
+    # static folder, then re-write its clinic_config.yaml so the filename
+    # is recorded -- same file the MCP tool subprocess already knows how
+    # to serve via get_offers_image_url().
+    if offers_image is not None and offers_image.filename:
+        safe_ext = re.sub(r"[^a-zA-Z0-9.]", "", os.path.splitext(offers_image.filename)[1]) or ".jpg"
+        dest_filename = f"brochure{safe_ext}"
+        dest_path = os.path.join(clinic["static_dir"], dest_filename)
+        contents = await offers_image.read()
+        with open(dest_path, "wb") as f:
+            f.write(contents)
+        clinic["offers_image_filename"] = dest_filename
+        clinics_store.update_offers_image_filename(clinic["id"], dest_filename)
+        clinics_store.write_clinic_config_yaml(clinic)
+
+    subscribe_result = _subscribe_waba(clinic["whatsapp_waba_id"], clinic["whatsapp_access_token"])
+
+    launch_clinic_worker(clinic)
+
+    if subscribe_result["ok"]:
+        message = (
+            f'<div class="flash-ok">✅ {html.escape(clinic["name"])} was added and is now LIVE on this service '
+            f'-- its WhatsApp number will start replying immediately. No restart or redeploy needed.</div>'
+        )
+    else:
+        message = (
+            f'<div class="flash-err">⚠️ {html.escape(clinic["name"])} was added and its worker was started, '
+            f"but subscribing its WABA to this app failed (this usually means the access token or WABA ID is "
+            f"wrong, or the token doesn't have the whatsapp_business_management permission on it):\n"
+            f"{html.escape(str(subscribe_result['body']))}\n\n"
+            f"Fix the token/WABA ID and re-subscribe manually (see check_subscription.py), or remove and re-add "
+            f"this clinic once you have the right credentials.</div>"
+        )
+
+    return HTMLResponse(_render_page(message))

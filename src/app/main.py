@@ -11,7 +11,9 @@ from shared.logger_config import setup_logging
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from . import whatsapp as whatsapp
-from . import agent as agent_process
+from . import admin
+from .clinic_registry import launch_clinic_worker, get_worker_by_phone_number_id
+from shared import clinics_store
 
 load_dotenv()
 setup_logging()
@@ -32,33 +34,64 @@ def _set_env(var: str):
             "hosting platform's environment variables (or in .env for local runs)."
         )
 
-# incase env vars are not set, prompt for them (only when running interactively)
+# App-level environment variables -- shared by every clinic running in this
+# one service, since they all go through the same Meta App. Per-clinic
+# credentials (access token, phone number ID, WABA ID) are no longer
+# environment variables at all -- they live in the clinics store (see
+# shared/clinics_store.py) and are entered once, per clinic, at
+# /admin/clinics. META_ACCESS_TOKEN / META_PHONE_NUMBER_ID are still read
+# from the environment ONCE, by clinics_store.migrate_legacy_single_clinic_if_needed(),
+# purely to carry over a deployment that predates this feature -- see that
+# function for details.
 _set_env("ANTHROPIC_API_KEY")
-_set_env("META_ACCESS_TOKEN")
 _set_env("META_APP_SECRET")
 _set_env("GRAPH_API_VERSION")
-_set_env("META_PHONE_NUMBER_ID")
 _set_env("META_VERIFY_TOKEN")
+_set_env("ADMIN_PASSWORD")
 
 # Get a logger for this module
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+app.include_router(admin.router)
 
 # Serves files from the static/ folder (e.g. the offers/promotions brochure
-# image) at public URLs like <your-app-url>/static/brochure.jpg — this is
+# image) at public URLs like <your-app-url>/static/brochure.jpg -- this is
 # what lets Sia send that image over WhatsApp, since WhatsApp needs a real,
-# publicly reachable URL rather than a local file path. To change the
-# brochure, just replace static/brochure.jpg (see config/clinic_config.yaml).
+# publicly reachable URL rather than a local file path. This mount is only
+# used by the ORIGINAL clinic (migrated from before multi-clinic support);
+# clinics added through /admin/clinics use the /clinic-static mount below
+# instead, so their brochure files never collide by filename.
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# Serves every clinic's own uploaded brochure image, one subfolder per
+# clinic slug (data/clinics/<slug>/static/<file>), at
+# /clinic-static/<slug>/static/<file> -- see clinic_config.py's
+# CLINIC_STATIC_URL_PREFIX for how each clinic's own URL is built.
+os.makedirs(clinics_store.DATA_ROOT, exist_ok=True)
+app.mount("/clinic-static", StaticFiles(directory=clinics_store.DATA_ROOT), name="clinic_static")
+
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting agent consumer process in the background...")
-    asyncio.create_task(agent_process.main())
+    clinics_store.init_control_db()
+    clinics_store.migrate_legacy_single_clinic_if_needed()
+
+    clinics = clinics_store.list_clinics()
+    if not clinics:
+        logger.warning(
+            "No clinics are configured yet. Add the first one at /admin/clinics "
+            "(username 'admin' by default, password from ADMIN_PASSWORD)."
+        )
+
+    for clinic in clinics:
+        if not clinic["active"]:
+            logger.info("Skipping inactive clinic id=%s slug=%s", clinic["id"], clinic["slug"])
+            continue
+        logger.info("Starting agent consumer process for clinic %s (%s)...", clinic["id"], clinic["name"])
+        launch_clinic_worker(clinic)
 
 
 def verify_signature(request: Request):
@@ -103,11 +136,12 @@ async def verify_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Missing parameters for verification")
 
 
-# Per-clinic subscription/trial cutoff. Configured per Railway deployment
-# via SUBSCRIPTION_PLAN and SUBSCRIPTION_STARTED_AT (e.g. "2026-09-18").
-# If either is unset (like on this test instance), the clinic is always
-# treated as active -- this only kicks in once both are set for a real
-# clinic deployment.
+# Per-clinic subscription/trial cutoff. Configured per clinic via the
+# subscription_plan / subscription_started_at fields on its clinics-store
+# row (set when the clinic is added at /admin/clinics, editable directly
+# in the database if a plan needs to change later). If either is missing
+# for some reason, the clinic is always treated as active so it's never
+# accidentally blocked.
 SUBSCRIPTION_PLAN_DAYS = {
     "trial": 7,
     "1_month": 30,
@@ -117,17 +151,19 @@ SUBSCRIPTION_PLAN_DAYS = {
 }
 
 
-def is_subscription_active() -> bool:
-    started_at_str = os.environ.get("SUBSCRIPTION_STARTED_AT")
-    plan = os.environ.get("SUBSCRIPTION_PLAN")
+def is_subscription_active(clinic: dict) -> bool:
+    started_at_str = clinic.get("subscription_started_at")
+    plan = clinic.get("subscription_plan")
     if not started_at_str or not plan:
         return True
     days = SUBSCRIPTION_PLAN_DAYS.get(plan)
     if not days:
-        logger.error(f"Unknown SUBSCRIPTION_PLAN '{plan}' -- treating this clinic as active so it is never accidentally blocked.")
+        logger.error(f"Unknown subscription_plan '{plan}' for clinic {clinic.get('slug')} -- treating this clinic as active so it is never accidentally blocked.")
         return True
     started_at = datetime.strptime(started_at_str, "%Y-%m-%d")
     return datetime.now() < started_at + timedelta(days=days)
+
+
 @app.post("/webhook")
 async def receive_webhook(request: Request, signature_valid: bool = Depends(verify_signature)):
     logger.debug("Received a POST request on /webhook")
@@ -143,19 +179,32 @@ async def receive_webhook(request: Request, signature_valid: bool = Depends(veri
     # Respond to status updates (like message delivered, read etc.)
     if whatsapp.is_status_update(body):
         status = whatsapp.parse_status_update(body)
-        # Logged at INFO (not debug) and with the full status object --
-        # temporary/diagnostic-friendly change so delivery failures (which
-        # include an "errors" field with the real reason) show up in
-        # Railway's log viewer without digging through debug-level noise.
         logger.info(f"WhatsApp status update: {status}")
         return {"status": "ok"}
-        
-    if whatsapp.is_valid_message(body) and not is_subscription_active():
+
+    # This one shared endpoint receives messages for EVERY clinic running
+    # on this service. Every event says which WhatsApp number it arrived
+    # on (phone_number_id) -- that's how we tell clinics apart and route
+    # to the right one's own worker/database/credentials.
+    receiving_phone_number_id = whatsapp.get_receiving_phone_number_id(body)
+    worker = get_worker_by_phone_number_id(receiving_phone_number_id) if receiving_phone_number_id else None
+
+    if whatsapp.is_valid_message(body) and worker is None:
         sender = whatsapp.get_message_sender(body)
-        logger.info(f"Message from {sender} ignored -- this clinic's subscription/trial has ended.")
+        logger.error(
+            f"Received a message for phone_number_id={receiving_phone_number_id}, which isn't a clinic "
+            f"registered on this service (sender: {sender}). Was this number's clinic added at /admin/clinics?"
+        )
+        # Acknowledge safely either way -- Meta shouldn't see this as a
+        # failed delivery, since that risks Meta throttling the webhook.
+        return {"status": "ok"}
+
+    if whatsapp.is_valid_message(body) and not is_subscription_active(worker.clinic):
+        sender = whatsapp.get_message_sender(body)
+        logger.info(f"[{worker.clinic['slug']}] Message from {sender} ignored -- this clinic's subscription/trial has ended.")
         if sender:
             try:
-                whatsapp.send_message(
+                worker.send(
                     sender,
                     "Sorry, this clinic's subscription has ended. Please contact us to renew. 🙏\n"
                     "عذرًا، انتهت فترة اشتراك هذه العيادة. يرجى التواصل معنا للتجديد.",
@@ -167,26 +216,23 @@ async def receive_webhook(request: Request, signature_valid: bool = Depends(veri
     try:
         if whatsapp.is_valid_message(body) and whatsapp.is_text_message(body):
             phone_number, message_body = whatsapp.parse_phone_and_message(body)
-            logger.info(f"Incoming message from {phone_number}: {message_body}")
-            await agent_process.enqueue_message(phone_number, message_body)
+            logger.info(f"[{worker.clinic['slug']}] Incoming message from {phone_number}: {message_body}")
+            await worker.enqueue_message(phone_number, message_body)
 
             return {"status": "ok"}
         elif whatsapp.is_valid_message(body):
             # A real message, but not plain text (voice note, image, sticker,
             # reaction, location, etc) -- Sia/the agent pipeline only handles
-            # text today. Previously this fell through to
-            # parse_phone_and_message(), which raised and turned into a 400
-            # response to Meta -- repeated failed webhook deliveries risk
-            # Meta throttling/disabling the subscription entirely (same
-            # class of issue as the "unhandled event" case below). Instead:
-            # acknowledge safely and let the patient know in their own chat
-            # why nothing happened, rather than silently ignoring them.
+            # text today. Acknowledge safely and let the patient know in
+            # their own chat why nothing happened, rather than silently
+            # ignoring them or returning an error (repeated failed webhook
+            # deliveries risk Meta throttling/disabling the subscription).
             msg_type = body["entry"][0]["changes"][0]["value"]["messages"][0].get("type")
             sender = whatsapp.get_message_sender(body)
-            logger.info(f"Received unsupported message type '{msg_type}' from {sender} -- only text messages are handled today.")
+            logger.info(f"[{worker.clinic['slug']}] Received unsupported message type '{msg_type}' from {sender} -- only text messages are handled today.")
             if sender:
                 try:
-                    whatsapp.send_message(
+                    worker.send(
                         sender,
                         "Sorry, I can only read text messages right now — could you type your message instead? 🙏\n"
                         "عذرًا، يمكنني حاليًا قراءة الرسائل النصية فقط، هل يمكنك كتابة رسالتك؟",

@@ -27,21 +27,6 @@ from langchain_anthropic import ChatAnthropic
 
 logger = logging.getLogger(__name__)
 
-server_params = StdioServerParameters(
-    # Launch the MCP server as a module directly, using the exact same
-    # Python interpreter/environment this process is already running under
-    # (sys.executable), instead of shelling out to "uv run" again. The
-    # "uv" tool itself isn't installed inside this project's own virtual
-    # environment (only "uv sync"'s dependencies are), so re-invoking
-    # "uv" from inside here doesn't reliably work on every machine.
-    # "-m dentaldesk_mcp" runs src/dentaldesk_mcp/__main__.py directly,
-    # which does the same thing the "dentaldesk-mcp" command does.
-    command=sys.executable,
-    args=["-m", "dentaldesk_mcp", "--verbose"],
-    env=os.environ.copy(),
-    cwd=os.getcwd(),
-)
-
 
 class State(MessagesState):
     """Extends the base MessagesState to include last interaction time and patient info."""
@@ -50,322 +35,325 @@ class State(MessagesState):
     conversation_id: int | None = None
 
 
-# Global async queue
-message_queue: asyncio.Queue = asyncio.Queue()
-
-
-async def create_graph(session):
+class ClinicWorker:
     """
-    Creates and returns the agent graph.
-    The graph consists of nodes for the assistant, tool calls, and state updates.
-    The assistant node uses a ChatAnthropic (Claude) model with access to the provided tools.
-    Each conversation is tracked by a unique thread_id in the checkpointer.
-    Args:
-        session: The MCP client session to load tools from.
-    Returns:
-        The compiled StateGraph agent.
+    Runs the whole message-handling pipeline for ONE clinic: its own MCP
+    tool subprocess (with that clinic's own WhatsApp credentials and config
+    file in its environment), its own LangGraph agent, its own message
+    queue, and its own database file.
+
+    Multiple ClinicWorkers run side by side inside the same FastAPI
+    process (one per clinic, see app/main.py's startup), which is what
+    lets one Mawaid deployment serve several clinics at once without a
+    separate Railway service per clinic. Each worker's database calls run
+    inside its own asyncio task, with shared/db.py's contextvar pointed at
+    that clinic's own database file (see db.set_current_db_path) -- so two
+    clinics' data can never mix, even though the code is shared.
     """
-    logger.info("Creating agent graph...")
 
-    tools = await load_mcp_tools(session)
-    systemPrompt = await load_mcp_prompt(
-        session, 
-        "system_prompt"
-    )
+    def __init__(self, clinic: dict):
+        self.clinic = clinic
+        self.message_queue: asyncio.Queue = asyncio.Queue()
+        self.agent = None
 
-    # Use "or" rather than getenv's built-in default: a blank
-    # ANTHROPIC_MODEL_NAME="" in the .env file (which is fine to leave
-    # blank) still counts as "set" to getenv, so its default wouldn't
-    # otherwise kick in.
-    llm = ChatAnthropic(model=os.getenv("ANTHROPIC_MODEL_NAME") or "claude-sonnet-5")
-    llm_with_tools = llm.bind_tools(tools)
+        clinic_dir = os.path.dirname(clinic["config_path"])
+        server_env = os.environ.copy()
+        server_env.update({
+            "META_ACCESS_TOKEN": clinic["whatsapp_access_token"],
+            "META_PHONE_NUMBER_ID": clinic["whatsapp_phone_number_id"],
+            "CLINIC_CONFIG_PATH": clinic["config_path"],
+            "CLINIC_DB_PATH": clinic["db_path"],
+            "CLINIC_STATIC_URL_PREFIX": f"/clinic-static/{clinic['slug']}/static",
+        })
 
-    # Graph
-    builder = StateGraph(State)
+        self.server_params = StdioServerParameters(
+            # Launch the MCP server as a module directly, using the exact
+            # same Python interpreter/environment this process is already
+            # running under (sys.executable). Each clinic gets its OWN
+            # subprocess with its OWN environment above -- that's what
+            # keeps clinic_config.py and whatsapp.py (which just read
+            # os.environ, unchanged) correct without needing to know
+            # anything about multi-clinic support themselves.
+            command=sys.executable,
+            args=["-m", "dentaldesk_mcp", "--verbose"],
+            env=server_env,
+            cwd=os.getcwd(),
+        )
 
-    # Node: Assistant
-    def assistant(state: State):
-        """The main assistant node that generates responses using the LLM and tools."""
-        logger.debug(f"Assistant node invoked with state: {state}")
-        patient = state.get("patient")
-        patient_context = ""
-        if patient:
-            patient_context = (f"\n\n--- Current Patient Information ---\n"
-                             f"Name: {patient.name}\n"
-                             f"Age: {patient.age or 'Not provided'}\n"
-                             f"Gender: {patient.gender or 'Not provided'}\n"
-                             f"Phone Number: {patient.phone_number}\n"
-                             f"Current Conversation ID: {state.get('conversation_id')}\n"
-                             f"---------------------------------")
-        
-        final_system_prompt = systemPrompt[0].content + patient_context
-        sys_msg = SystemMessage(content=final_system_prompt)
-        response = llm_with_tools.invoke([sys_msg] + state["messages"])
-        return {"messages": [response]}
+    async def create_graph(self, session):
+        """
+        Creates and returns this clinic's agent graph. Same shape as the
+        original single-clinic version -- the system prompt is generic
+        (Sia looks up clinic-specific facts via tools rather than having
+        them baked into her instructions), so it doesn't need to change
+        per clinic; only the tools/session underneath it do.
+        """
+        logger.info("Creating agent graph for clinic %s (%s)...", self.clinic["id"], self.clinic["name"])
 
-    # Node: Update Timestamp
-    def update_timestamp_node(state: State) -> dict:
-        """Nodes that just updates the timestamp in the state."""
-        return {"last_interaction_time": datetime.now()}
-    
-    builder.add_node("assistant", assistant)
-    builder.add_node("tools", ToolNode(tools))
-    builder.add_node("update_timestamp", update_timestamp_node)
+        tools = await load_mcp_tools(session)
+        systemPrompt = await load_mcp_prompt(session, "system_prompt")
 
-    builder.add_edge(START, "assistant")
-    builder.add_conditional_edges(
-        "assistant",
-        tools_condition,
-        {
-            "tools": "tools", 
-            "__end__": "update_timestamp"  # If no tools are called, update timestamp before ending
-        }
-    )
-    builder.add_edge("tools", "assistant")
-    builder.add_edge("update_timestamp", END) # After updating, end the graph
+        llm = ChatAnthropic(model=os.getenv("ANTHROPIC_MODEL_NAME") or "claude-sonnet-5")
+        llm_with_tools = llm.bind_tools(tools)
 
-    memory = InMemorySaver()
-    agent = builder.compile(checkpointer=memory)
+        builder = StateGraph(State)
 
-    return agent
+        def assistant(state: State):
+            """The main assistant node that generates responses using the LLM and tools."""
+            logger.debug(f"Assistant node invoked with state: {state}")
+            patient = state.get("patient")
+            patient_context = ""
+            if patient:
+                patient_context = (f"\n\n--- Current Patient Information ---\n"
+                                 f"Name: {patient.name}\n"
+                                 f"Age: {patient.age or 'Not provided'}\n"
+                                 f"Gender: {patient.gender or 'Not provided'}\n"
+                                 f"Phone Number: {patient.phone_number}\n"
+                                 f"Current Conversation ID: {state.get('conversation_id')}\n"
+                                 f"---------------------------------")
 
+            final_system_prompt = systemPrompt[0].content + patient_context
+            sys_msg = SystemMessage(content=final_system_prompt)
+            response = llm_with_tools.invoke([sys_msg] + state["messages"])
+            return {"messages": [response]}
 
-async def enqueue_message(patient_phone: str, message: str):
-    """
-    Async function to enqueue incoming messages for processing by the agent.
-    Finds or creates a patient and a conversation, then adds the message to the queue.
-    The patient is identified by their phone number.
-    Args:
-        patient_phone: The phone number of the patient sending the message.
-        message: The content of the message sent by the patient.
-    returns: 
-        None
-    """
-    logger.debug(f"Enqueueing message from {patient_phone}")
+        def update_timestamp_node(state: State) -> dict:
+            """Nodes that just updates the timestamp in the state."""
+            return {"last_interaction_time": datetime.now()}
 
-    # Find a patient record
-    patient = db.get_patient_by_phone(patient_phone)
-    if not patient:
-        # For a new patient, create a basic record. The agent can gather more details.
-        patient = db.create_patient(Patient(name="New Patient", phone_number=patient_phone))
+        builder.add_node("assistant", assistant)
+        builder.add_node("tools", ToolNode(tools))
+        builder.add_node("update_timestamp", update_timestamp_node)
 
-    # Find an open conversation for the patient or create a new one
-    conversation = db.get_open_conversation(patient.id)
-    if not conversation:
-        conversation = db.create_conversation(patient.id)
-    
-    logger.info(f"Enqueuing message for patient {patient.id} in conversation {conversation.id}")
+        builder.add_edge(START, "assistant")
+        builder.add_conditional_edges(
+            "assistant",
+            tools_condition,
+            {
+                "tools": "tools",
+                "__end__": "update_timestamp"
+            }
+        )
+        builder.add_edge("tools", "assistant")
+        builder.add_edge("update_timestamp", END)
 
-    await message_queue.put({
-        "conversation_id": conversation.id,
-        "patient": patient,
-        "message": message,
-        "timestamp": datetime.now(),
-    })
+        memory = InMemorySaver()
+        agent = builder.compile(checkpointer=memory)
 
+        return agent
 
-async def consume_messages(agent):
-    """
-    Continuously consumes messages from the queue and processes them with the agent.
-    Args:
-        agent: The StateGraph agent to process messages.
-    """
-    logger.info("Starting message consumer...")
+    async def enqueue_message(self, patient_phone: str, message: str):
+        """
+        Enqueues an incoming message for processing by THIS clinic's
+        agent. Finds or creates a patient and a conversation (in this
+        clinic's own database), then adds the message to this clinic's
+        own queue.
+        """
+        logger.debug(f"[{self.clinic['slug']}] Enqueueing message from {patient_phone}")
 
-    while True:
-        logger.debug("Waiting for new message in queue...")
-        task = await message_queue.get()
-        conversation_id = task.get("conversation_id")
-        try:
-            patient = task["patient"]
-            message = task["message"]
-            patient_phone_for_reply = patient.phone_number
+        patient = db.get_patient_by_phone(patient_phone)
+        if not patient:
+            patient = db.create_patient(Patient(name="New Patient", phone_number=patient_phone))
 
-            config = {"configurable": {"thread_id": str(conversation_id)}}
+        conversation = db.get_open_conversation(patient.id)
+        if not conversation:
+            conversation = db.create_conversation(patient.id)
 
-            # If agent has no state for this conversation, load it from the database.
-            # This handles cases where the agent restarts and loses its in-memory state.
-            # current_state is of type StateSnapshot
-            current_state = await agent.aget_state(config)
-            logger.debug(f"Current state for conversation {conversation_id}: {current_state}")
+        logger.info(f"[{self.clinic['slug']}] Enqueuing message for patient {patient.id} in conversation {conversation.id}")
 
-            if current_state is None or not current_state.values.get("messages"):
-                logger.info(f"No agent state found for conversation {conversation_id}. Checking DB for history...")
-                history = db.get_messages(conversation_id)
-                history_messages = []
-                if history:
-                    for msg in history:
-                        # Convert DB messages to appropriate Message types
-                        if msg.sender == 'user':
-                            history_messages.append(HumanMessage(content=msg.message))
-                        elif msg.sender == 'agent':
-                            history_messages.append(AIMessage(content=msg.message))
-                        elif msg.sender == 'agent_tool_call':
-                            # Rebuild AIMessage with tool_calls from JSON
-                            tool_calls = json.loads(msg.message)
-                            history_messages.append(AIMessage(content="", tool_calls=tool_calls))
-                        elif msg.sender == 'tool':
-                            # Rebuild ToolMessage from JSON
-                            tool_data = json.loads(msg.message)
-                            history_messages.append(ToolMessage(content=tool_data['content'], tool_call_id=tool_data['tool_call_id']))
-                
-                update_payload = {
-                    "messages": history_messages,
-                    "patient": patient,
-                    "conversation_id": conversation_id,
-                }
-                logger.info(f"Updating state for conversation {conversation_id} with {len(history_messages)} messages and patient info.")
-                await agent.aupdate_state(config, update_payload, START)
+        await self.message_queue.put({
+            "conversation_id": conversation.id,
+            "patient": patient,
+            "message": message,
+            "timestamp": datetime.now(),
+        })
 
-            # Add the new user message to the database
-            db.add_message(conversation_id=conversation_id, sender="user", message=message)
+    async def consume_messages(self):
+        """
+        Continuously consumes messages from this clinic's queue and
+        processes them with this clinic's agent. Identical logic to the
+        original single-clinic consumer, just scoped to one clinic's queue,
+        agent, and WhatsApp credentials.
+        """
+        agent = self.agent
+        logger.info(f"[{self.clinic['slug']}] Starting message consumer...")
 
-            # Invoke the agent with the new message
-            response = await agent.ainvoke({"messages": [HumanMessage(content=message)]}, config)
+        while True:
+            logger.debug(f"[{self.clinic['slug']}] Waiting for new message in queue...")
+            task = await self.message_queue.get()
+            conversation_id = task.get("conversation_id")
+            try:
+                patient = task["patient"]
+                message = task["message"]
+                patient_phone_for_reply = patient.phone_number
 
-            # Find the index of the last HumanMessage to identify messages from this turn.
-            last_human_message_index = -1
-            for i, msg in reversed(list(enumerate(response["messages"]))):
-                if isinstance(msg, HumanMessage):
-                    last_human_message_index = i
-                    break
+                config = {"configurable": {"thread_id": str(conversation_id)}}
 
-            # Process and save all messages generated by the agent in the current turn.
-            if last_human_message_index != -1:
-                messages_this_turn = response["messages"][last_human_message_index + 1:]
-                for msg in messages_this_turn:
-                    if isinstance(msg, AIMessage):
-                        if msg.tool_calls:
-                            # Persist the agent's decision to call a tool by saving the tool_calls list as JSON
+                current_state = await agent.aget_state(config)
+                logger.debug(f"[{self.clinic['slug']}] Current state for conversation {conversation_id}: {current_state}")
+
+                if current_state is None or not current_state.values.get("messages"):
+                    logger.info(f"[{self.clinic['slug']}] No agent state found for conversation {conversation_id}. Checking DB for history...")
+                    history = db.get_messages(conversation_id)
+                    history_messages = []
+                    if history:
+                        for msg in history:
+                            if msg.sender == 'user':
+                                history_messages.append(HumanMessage(content=msg.message))
+                            elif msg.sender == 'agent':
+                                history_messages.append(AIMessage(content=msg.message))
+                            elif msg.sender == 'agent_tool_call':
+                                tool_calls = json.loads(msg.message)
+                                history_messages.append(AIMessage(content="", tool_calls=tool_calls))
+                            elif msg.sender == 'tool':
+                                tool_data = json.loads(msg.message)
+                                history_messages.append(ToolMessage(content=tool_data['content'], tool_call_id=tool_data['tool_call_id']))
+
+                    update_payload = {
+                        "messages": history_messages,
+                        "patient": patient,
+                        "conversation_id": conversation_id,
+                    }
+                    logger.info(f"[{self.clinic['slug']}] Updating state for conversation {conversation_id} with {len(history_messages)} messages and patient info.")
+                    await agent.aupdate_state(config, update_payload, START)
+
+                db.add_message(conversation_id=conversation_id, sender="user", message=message)
+
+                response = await agent.ainvoke({"messages": [HumanMessage(content=message)]}, config)
+
+                last_human_message_index = -1
+                for i, msg in reversed(list(enumerate(response["messages"]))):
+                    if isinstance(msg, HumanMessage):
+                        last_human_message_index = i
+                        break
+
+                if last_human_message_index != -1:
+                    messages_this_turn = response["messages"][last_human_message_index + 1:]
+                    for msg in messages_this_turn:
+                        if isinstance(msg, AIMessage):
+                            if msg.tool_calls:
+                                db.add_message(
+                                    conversation_id=conversation_id,
+                                    sender="agent_tool_call",
+                                    message=json.dumps(msg.tool_calls)
+                                )
+                            elif msg.content:
+                                reply_text = extract_reply_text(msg.content)
+                                if reply_text:
+                                    db.add_message(conversation_id=conversation_id, sender="agent", message=reply_text)
+                                    self.send(patient_phone_for_reply, reply_text)
+                        elif isinstance(msg, ToolMessage):
+                            tool_data = {"content": msg.content, "tool_call_id": msg.tool_call_id}
                             db.add_message(
                                 conversation_id=conversation_id,
-                                sender="agent_tool_call",
-                                message=json.dumps(msg.tool_calls)
+                                sender="tool",
+                                message=json.dumps(tool_data)
                             )
-                        elif msg.content:
-                            # This is the final text reply for the user. Claude
-                            # sometimes attaches an internal "thinking" block
-                            # alongside the answer, which turns msg.content into
-                            # a list of content blocks instead of a plain string
-                            # — extract_reply_text() pulls out just the actual
-                            # reply text so we never save/send raw block data.
-                            reply_text = extract_reply_text(msg.content)
-                            if reply_text:
-                                db.add_message(conversation_id=conversation_id, sender="agent", message=reply_text)
-                                send_message(patient_phone_for_reply, reply_text)
-                    elif isinstance(msg, ToolMessage):
-                        # Persist the tool result by saving its content and ID as JSON
-                        tool_data = {"content": msg.content, "tool_call_id": msg.tool_call_id}
-                        db.add_message(
-                            conversation_id=conversation_id,
-                            sender="tool",
-                            message=json.dumps(tool_data)
-                        )
-            else:
-                # Fallback for cases where no new agent messages were generated after the user's.
-                reply = extract_reply_text(response["messages"][-1].content)
-                if reply:
-                    db.add_message(conversation_id=conversation_id, sender="agent", message=reply)
-                    send_message(patient_phone_for_reply, reply)
+                else:
+                    reply = extract_reply_text(response["messages"][-1].content)
+                    if reply:
+                        db.add_message(conversation_id=conversation_id, sender="agent", message=reply)
+                        self.send(patient_phone_for_reply, reply)
 
-        except Exception as e:
-            logger.error(f"[Agent Error] Failed to process message for conversation {conversation_id}: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"[{self.clinic['slug']}] [Agent Error] Failed to process message for conversation {conversation_id}: {e}", exc_info=True)
 
-        finally:
-            message_queue.task_done()
+            finally:
+                self.message_queue.task_done()
 
+    def send(self, phone_number: str, message: str):
+        """Sends a WhatsApp text message using THIS clinic's own
+        credentials -- never the process-wide environment variables, since
+        several clinics' credentials all coexist in this one process now."""
+        send_message(
+            phone_number,
+            message,
+            access_token=self.clinic["whatsapp_access_token"],
+            phone_number_id=self.clinic["whatsapp_phone_number_id"],
+            api_version=os.environ.get("GRAPH_API_VERSION"),
+        )
 
-async def conversation_cleanup_task(agent):
-    """
-    Periodically checks for timed-out conversations and closes them.
-    A conversation is considered timed out if there has been no interaction for a specified interval.
-    This function runs indefinitely as a background task.
-    Args:
-        agent: The StateGraph agent whose checkpointer is used to track conversations.
-        interval_minutes: The interval in minutes to check for timed-out conversations.
-    """
-    logger.info("Starting conversation cleanup task...")
-    interval_minutes=int(os.getenv("CONVERSATION_TIMEOUT_MINUTES", 30))
+    async def conversation_cleanup_task(self):
+        """
+        Periodically checks for timed-out conversations (for this clinic
+        only) and closes them. Identical logic to the original
+        single-clinic version, just scoped to this clinic's agent/db.
+        """
+        logger.info(f"[{self.clinic['slug']}] Starting conversation cleanup task...")
+        interval_minutes = int(os.getenv("CONVERSATION_TIMEOUT_MINUTES", 30))
+        agent = self.agent
 
-    while True:
-        await asyncio.sleep(interval_minutes * 60)
-        logger.info("Running conversation cleanup task...")
+        while True:
+            await asyncio.sleep(interval_minutes * 60)
+            logger.info(f"[{self.clinic['slug']}] Running conversation cleanup task...")
 
-        checkpointer = agent.checkpointer
-        if checkpointer is None:
-            logger.warning("Agent has no checkpointer. Skipping cleanup.")
-            continue
+            checkpointer = agent.checkpointer
+            if checkpointer is None:
+                logger.warning(f"[{self.clinic['slug']}] Agent has no checkpointer. Skipping cleanup.")
+                continue
 
-        # create a set of thread_ids to avoid modifying the dict while iterating
-        all_thread_ids = set()
-        try:
-            for item in checkpointer.list(None):
-                config = item.config
-                thread_id = config["configurable"]["thread_id"]
-                all_thread_ids.add(thread_id)
-                
-        except Exception as e:
-            logger.error(f"Error listing threads from checkpointer: {e}", exc_info=True)
+            all_thread_ids = set()
+            try:
+                for item in checkpointer.list(None):
+                    config = item.config
+                    thread_id = config["configurable"]["thread_id"]
+                    all_thread_ids.add(thread_id)
+            except Exception as e:
+                logger.error(f"[{self.clinic['slug']}] Error listing threads from checkpointer: {e}", exc_info=True)
 
-        if not all_thread_ids:
-            logger.info("No active conversation threads found in checkpointer.")
-            continue
+            if not all_thread_ids:
+                logger.info(f"[{self.clinic['slug']}] No active conversation threads found in checkpointer.")
+                continue
 
-        try:
-            logger.debug(f"Current active threads in checkpointer: {all_thread_ids}")
-            for thread_id in all_thread_ids:
-                config = {"configurable": {"thread_id": thread_id}}
-                state = await agent.aget_state(config)
-                logger.debug(f"Checking thread {thread_id} with state: {state}")
-                if state and state.values and state.values.get("last_interaction_time"):
-                    last_interaction = state.values["last_interaction_time"]
-                    if isinstance(last_interaction, str):
-                        last_interaction = datetime.fromisoformat(last_interaction)
+            try:
+                logger.debug(f"[{self.clinic['slug']}] Current active threads in checkpointer: {all_thread_ids}")
+                for thread_id in all_thread_ids:
+                    config = {"configurable": {"thread_id": thread_id}}
+                    state = await agent.aget_state(config)
+                    logger.debug(f"[{self.clinic['slug']}] Checking thread {thread_id} with state: {state}")
+                    if state and state.values and state.values.get("last_interaction_time"):
+                        last_interaction = state.values["last_interaction_time"]
+                        if isinstance(last_interaction, str):
+                            last_interaction = datetime.fromisoformat(last_interaction)
 
-                    if (datetime.now() - last_interaction).total_seconds() > (interval_minutes * 60):
-                        logger.info(f"Conversation thread {thread_id} has timed out.")
-                        # Check DB status before closing to avoid race conditions
-                        conversation = db.get_conversation(int(thread_id))
-                        if conversation and conversation.status == 'open':
-                            logger.info(f"Closing conversation {thread_id} in DB with reason 'timed_out'.")
-                            db.close_conversation(int(thread_id), reason="timed_out")
-                        else:
-                            logger.info(f"Conversation {thread_id} already closed in DB, skipping DB update.")
+                        if (datetime.now() - last_interaction).total_seconds() > (interval_minutes * 60):
+                            logger.info(f"[{self.clinic['slug']}] Conversation thread {thread_id} has timed out.")
+                            conversation = db.get_conversation(int(thread_id))
+                            if conversation and conversation.status == 'open':
+                                logger.info(f"[{self.clinic['slug']}] Closing conversation {thread_id} in DB with reason 'timed_out'.")
+                                db.close_conversation(int(thread_id), reason="timed_out")
+                            else:
+                                logger.info(f"[{self.clinic['slug']}] Conversation {thread_id} already closed in DB, skipping DB update.")
 
-                        # delete the thread from the checkpointer
+                            checkpointer.delete_thread(thread_id)
+                            logger.info(f"[{self.clinic['slug']}] Removed thread {thread_id} from agent checkpointer.")
+
+                    elif not state or not state.values:
                         checkpointer.delete_thread(thread_id)
-                        logger.info(f"Removed thread {thread_id} from agent checkpointer.")
+                        logger.info(f"[{self.clinic['slug']}] Found lingering empty thread {thread_id}. Cleaning up.")
 
-                # Also clean up threads that have no state or interaction time, but are lingering
-                elif not state or not state.values:
-                    checkpointer.delete_thread(thread_id)
-                    logger.info(f"Found lingering empty thread {thread_id}. Cleaning up.")
+            except Exception as e:
+                logger.error(f"[{self.clinic['slug']}] Error during cleanup for thread {thread_id}: {e}", exc_info=True)
 
-        except Exception as e:
-            logger.error(f"Error during cleanup for thread {thread_id}: {e}", exc_info=True)
+    async def run(self):
+        """
+        Brings this one clinic fully online: points shared/db.py at this
+        clinic's own database file for the lifetime of this task, starts
+        its MCP subprocess, builds its agent, and runs its queue consumer
+        and cleanup task forever (until the app shuts down).
+        """
+        db.set_current_db_path(self.clinic["db_path"])
+        logger.info(f"[{self.clinic['slug']}] Checking and initializing database...")
+        db.init_db(seed=True, dentists=self.clinic.get("dentists"))
 
+        async with stdio_client(self.server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await load_mcp_tools(session)
+                logger.debug(f"[{self.clinic['slug']}] Loaded MCP tools: {[tool.name for tool in tools]}")
 
-async def main():
-    # Ensure the database is initialized before starting the agent
-    logger.info("Checking and initializing database...")
-    db.init_db(seed=True)
+                self.agent = await self.create_graph(session)
 
-    # start up the MCP server locally and run our agent
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            # Initialize the connection
-            await session.initialize()
-            tools = await load_mcp_tools(session)
-            logger.debug(f"Loaded MCP tools: {[tool.name for tool in tools]}")
+                asyncio.create_task(self.conversation_cleanup_task())
 
-            agent = await create_graph(session)
-    
-            # Start the background cleanup task
-            asyncio.create_task(conversation_cleanup_task(agent))
-
-            # Start consuming queue
-            await consume_messages(agent)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                await self.consume_messages()

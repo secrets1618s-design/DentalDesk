@@ -20,10 +20,10 @@ load_dotenv()
 from shared.logger_config import setup_logging
 setup_logging()
 
-from shared import db
+from shared import db, clinics_store
 from shared.models import Patient
 from shared.message_utils import extract_reply_text
-from app.agent import create_graph, server_params
+from app.agent import ClinicWorker
 
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
@@ -36,8 +36,28 @@ TEST_PHONE_NUMBER = "terminal-test-user"
 
 
 async def main():
+    # This app can run several clinics at once now (see app/agent.py's
+    # ClinicWorker) -- for this terminal test harness, just use whichever
+    # clinic is already configured (the legacy single-clinic .env vars, or
+    # the first one added via /admin/clinics).
+    clinics_store.init_control_db()
+    clinics_store.migrate_legacy_single_clinic_if_needed()
+    clinics = clinics_store.list_clinics()
+    if not clinics:
+        print(
+            "No clinic is configured yet. Either set META_ACCESS_TOKEN and "
+            "META_PHONE_NUMBER_ID in your .env (for the original single-clinic "
+            "setup), or add a clinic via /admin/clinics first."
+        )
+        return
+    clinic = clinics[0]
+    print(f"Using clinic: {clinic['name']} ({clinic['slug']})")
+
+    worker = ClinicWorker(clinic)
+    db.set_current_db_path(clinic["db_path"])
+
     # Make sure the database exists and has the sample dentists in it.
-    db.init_db(seed=True)
+    db.init_db(seed=True, dentists=clinic.get("dentists"))
 
     # Find or create a fake "patient" for this terminal session, the same
     # way a real WhatsApp message would.
@@ -51,10 +71,10 @@ async def main():
 
     print("Starting the MCP server and connecting the agent...")
 
-    async with stdio_client(server_params) as (read, write):
+    async with stdio_client(worker.server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            agent = await create_graph(session)
+            agent = await worker.create_graph(session)
 
             config = {"configurable": {"thread_id": str(conversation.id)}}
 
