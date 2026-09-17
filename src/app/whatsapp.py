@@ -89,13 +89,19 @@ def send_message(phone_number, message):
     url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
 
     try:
-        response = requests.post(url, data=data, headers=headers)  
+        response = requests.post(url, data=data, headers=headers)
         response.raise_for_status()
     except requests.Timeout:
         logger.error("Whatsapp send message request timed out")
         raise HTTPException(status_code=408, detail="Request Timeout")
     except requests.RequestException as e:
-        logger.error(f"Internal Server Error, failed to send message : {e}")
+        # raise_for_status()'s own exception text doesn't include the
+        # response body, but Meta's Graph API puts the actual reason
+        # (invalid/expired token, missing permission, wrong asset, etc)
+        # in a JSON "error" object in the body -- log it explicitly so
+        # a plain "401 Unauthorized" in the logs doesn't hide why.
+        body = response.text if 'response' in locals() else "<no response>"
+        logger.error(f"Internal Server Error, failed to send message : {e} | response body: {body}")
         raise HTTPException(status_code=500, detail="Internal Server Error, failed to send message")
     else:
         logger.debug(f"send_message - status: {response.status_code}")
@@ -139,7 +145,8 @@ def send_image_message(phone_number, image_url, caption=None):
         logger.error("Whatsapp send image message request timed out")
         raise HTTPException(status_code=408, detail="Request Timeout")
     except requests.RequestException as e:
-        logger.error(f"Internal Server Error, failed to send image message : {e}")
+        body = response.text if 'response' in locals() else "<no response>"
+        logger.error(f"Internal Server Error, failed to send image message : {e} | response body: {body}")
         raise HTTPException(status_code=500, detail="Internal Server Error, failed to send image message")
     else:
         logger.debug(f"send_image_message - status: {response.status_code}")
