@@ -5,6 +5,7 @@ import hashlib
 import os, getpass
 import sys
 import asyncio
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from shared.logger_config import setup_logging
 from fastapi import FastAPI, Request, HTTPException, Depends
@@ -102,6 +103,31 @@ async def verify_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Missing parameters for verification")
 
 
+# Per-clinic subscription/trial cutoff. Configured per Railway deployment
+# via SUBSCRIPTION_PLAN and SUBSCRIPTION_STARTED_AT (e.g. "2026-09-18").
+# If either is unset (like on this test instance), the clinic is always
+# treated as active -- this only kicks in once both are set for a real
+# clinic deployment.
+SUBSCRIPTION_PLAN_DAYS = {
+    "trial": 7,
+    "1_month": 30,
+    "3_months": 90,
+    "6_months": 180,
+    "12_months": 365,
+}
+
+
+def is_subscription_active() -> bool:
+    started_at_str = os.environ.get("SUBSCRIPTION_STARTED_AT")
+    plan = os.environ.get("SUBSCRIPTION_PLAN")
+    if not started_at_str or not plan:
+        return True
+    days = SUBSCRIPTION_PLAN_DAYS.get(plan)
+    if not days:
+        logger.error(f"Unknown SUBSCRIPTION_PLAN '{plan}' -- treating this clinic as active so it is never accidentally blocked.")
+        return True
+    started_at = datetime.strptime(started_at_str, "%Y-%m-%d")
+    return datetime.now() < started_at + timedelta(days=days)
 @app.post("/webhook")
 async def receive_webhook(request: Request, signature_valid: bool = Depends(verify_signature)):
     logger.debug("Received a POST request on /webhook")
@@ -122,6 +148,20 @@ async def receive_webhook(request: Request, signature_valid: bool = Depends(veri
         # include an "errors" field with the real reason) show up in
         # Railway's log viewer without digging through debug-level noise.
         logger.info(f"WhatsApp status update: {status}")
+        return {"status": "ok"}
+        
+    if whatsapp.is_valid_message(body) and not is_subscription_active():
+        sender = whatsapp.get_message_sender(body)
+        logger.info(f"Message from {sender} ignored -- this clinic's subscription/trial has ended.")
+        if sender:
+            try:
+                whatsapp.send_message(
+                    sender,
+                    "Sorry, this clinic's subscription has ended. Please contact us to renew. 🙏\n"
+                    "عذرًا، انتهت فترة اشتراك هذه العيادة. يرجى التواصل معنا للتجديد.",
+                )
+            except Exception as e:
+                logger.error(f"Failed to send subscription-expired notice to {sender}: {e}")
         return {"status": "ok"}
 
     try:
