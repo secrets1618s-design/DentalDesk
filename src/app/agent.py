@@ -38,7 +38,7 @@ server_params = StdioServerParameters(
     # which does the same thing the "dentaldesk-mcp" command does.
     command=sys.executable,
     args=["-m", "dentaldesk_mcp", "--verbose"],
-    env=None,
+    env=os.environ.copy(),
     cwd=os.getcwd(),
 )
 
