@@ -37,7 +37,10 @@ def parse_status_update(body):
 
 def is_valid_message(body):
     """
-    Check if the incoming webhook event is a valid WhatsApp message.
+    Check if the incoming webhook event is a message WhatsApp event at all
+    (of any type -- text, image, voice note, sticker, reaction, location,
+    etc). Use `is_text_message` to further check it's specifically a text
+    message before calling `parse_phone_and_message` on it.
     """
     return (
         body.get("object")
@@ -49,21 +52,43 @@ def is_valid_message(body):
     )
 
 
+def is_text_message(body):
+    """
+    Check if the incoming message webhook event is specifically a plain
+    text message. Assumes `is_valid_message(body)` is already True.
+    """
+    try:
+        return body["entry"][0]["changes"][0]["value"]["messages"][0].get("type") == "text"
+    except Exception:
+        return False
+
+
+def get_message_sender(body):
+    """
+    Extracts the sender's phone number from a message webhook event,
+    regardless of the message type -- used so we can still reply to a
+    patient who sent something other than plain text (e.g. a voice note or
+    image), which `parse_phone_and_message` deliberately doesn't support.
+    Returns None if it can't be found.
+    """
+    try:
+        return body["entry"][0]["changes"][0]["value"]["messages"][0].get("from")
+    except Exception:
+        return None
+
+
 def parse_phone_and_message(body):
     """
     Parse the phone number and message body from the WhatsApp webhook event.
+    Only call this after confirming `is_text_message(body)` is True.
     """
     try:
         obj = body["entry"][0]["changes"][0]["value"]["messages"][0]
 
         phone_number = obj["from"]  # extract the phone number of the sender
-        msg_type = obj["type"]  # extract the type of message
-        if msg_type != "text":
-            raise HTTPException(status_code=400, detail="Unsupported message type")
-        
         message_body = obj["text"]["body"]  # extract the text message body
         return phone_number, message_body
-    
+
     except Exception as e:
         logger.error(f"Error parsing phone number and message: {e}")
         raise HTTPException(status_code=400, detail="Invalid WhatsApp message structure")

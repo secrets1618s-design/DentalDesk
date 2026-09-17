@@ -125,11 +125,34 @@ async def receive_webhook(request: Request, signature_valid: bool = Depends(veri
         return {"status": "ok"}
 
     try:
-        if whatsapp.is_valid_message(body):
+        if whatsapp.is_valid_message(body) and whatsapp.is_text_message(body):
             phone_number, message_body = whatsapp.parse_phone_and_message(body)
             logger.info(f"Incoming message from {phone_number}: {message_body}")
             await agent_process.enqueue_message(phone_number, message_body)
 
+            return {"status": "ok"}
+        elif whatsapp.is_valid_message(body):
+            # A real message, but not plain text (voice note, image, sticker,
+            # reaction, location, etc) -- Sia/the agent pipeline only handles
+            # text today. Previously this fell through to
+            # parse_phone_and_message(), which raised and turned into a 400
+            # response to Meta -- repeated failed webhook deliveries risk
+            # Meta throttling/disabling the subscription entirely (same
+            # class of issue as the "unhandled event" case below). Instead:
+            # acknowledge safely and let the patient know in their own chat
+            # why nothing happened, rather than silently ignoring them.
+            msg_type = body["entry"][0]["changes"][0]["value"]["messages"][0].get("type")
+            sender = whatsapp.get_message_sender(body)
+            logger.info(f"Received unsupported message type '{msg_type}' from {sender} -- only text messages are handled today.")
+            if sender:
+                try:
+                    whatsapp.send_message(
+                        sender,
+                        "Sorry, I can only read text messages right now — could you type your message instead? 🙏\n"
+                        "عذرًا، يمكنني حاليًا قراءة الرسائل النصية فقط، هل يمكنك كتابة رسالتك؟",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send unsupported-message-type notice to {sender}: {e}")
             return {"status": "ok"}
         else:
             # Not a text message we recognize (could be a reaction, a
