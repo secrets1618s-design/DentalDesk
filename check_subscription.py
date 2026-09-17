@@ -1,7 +1,8 @@
 """
 Checks whether the Mawaid app is subscribed to receive webhooks for the
-test WABA, and re-subscribes if not. Run this whenever incoming WhatsApp
-messages aren't reaching the webhook at all (no POST /webhook logged).
+production WABA, and re-subscribes if not. Run this whenever incoming
+WhatsApp messages aren't reaching the webhook at all (no POST /webhook
+logged).
 
 Usage:
     python -m uv run python check_subscription.py
@@ -13,7 +14,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 token = os.environ.get("META_ACCESS_TOKEN")
-waba_id = "2903100353357938"
+# Real production WhatsApp Business Account ID (was the test WABA
+# 2903100353357938 before we switched to a real registered number).
+waba_id = "2160066441578508"
 api_version = os.environ.get("GRAPH_API_VERSION", "v25.0")
 
 url = f"https://graph.facebook.com/{api_version}/{waba_id}/subscribed_apps"
