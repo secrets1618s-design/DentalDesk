@@ -28,14 +28,14 @@ from shared.db import db
 logger = logging.getLogger(__name__)
 
 # How many rows the (possibly filtered) recent-conversations feed will
-# return at most. Generous enough to browse a whole month's conversations
-# for a normal-size clinic; a name/month filter narrows well below this
-# in practice.
+# return at most. A clinic with a long history + a wide date range could
+# have a lot more than this; the note in the UI tells staff to narrow the
+# filter rather than silently truncating without saying so.
 RECENT_CONVERSATIONS_CAP = 100
 
 # How many trailing calendar months the "conversations by month" chart
-# covers. Independent of the days= period selector -- it's a trend view,
-# not a period-scoped KPI.
+# covers. Independent of the days= period selector and of the name/date
+# list filters -- it's a trend view, not a period KPI or a search result.
 TREND_MONTHS = 6
 
 
@@ -47,20 +47,16 @@ def _period_cutoff(days: Optional[int]) -> Optional[str]:
     return (datetime.now() - timedelta(days=days)).isoformat()
 
 
-def _month_bounds(month_str: str):
-    """'2026-09' -> (iso start of month, iso start of next month), or
-    (None, None) if month_str isn't a well-formed YYYY-MM string (a bad
-    query param shouldn't 500 the dashboard -- it just falls back to
-    unfiltered)."""
+def _parse_date(date_str: Optional[str]) -> Optional[datetime]:
+    """'2026-09-18' -> a datetime at midnight that day, or None if
+    date_str is empty/malformed. A bad query param shouldn't 500 the
+    dashboard -- it just falls back to "no bound on this side"."""
+    if not date_str:
+        return None
     try:
-        year, month = int(month_str[:4]), int(month_str[5:7])
-        if not (1 <= month <= 12) or month_str[4] != "-":
-            raise ValueError
-    except (ValueError, IndexError, TypeError):
-        return None, None
-    start = datetime(year, month, 1)
-    end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
-    return start.isoformat(), end.isoformat()
+        return datetime.strptime(date_str.strip(), "%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def _booked_during(conn, patient_id: Optional[int], started_at: str, ended_at: Optional[str]) -> bool:
@@ -85,7 +81,8 @@ def _booked_during(conn, patient_id: Optional[int], started_at: str, ended_at: O
 def get_dashboard_summary(
     days: Optional[int] = 7,
     name_filter: Optional[str] = None,
-    month_filter: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Builds everything the staff dashboard shows, in one call: top-line KPIs,
@@ -96,24 +93,29 @@ def get_dashboard_summary(
     trend -- all scoped to the last `days` days, or all-time if `days` is
     None.
 
-    name_filter / month_filter narrow the two conversation LISTS only
-    (needs_attention, recent_conversations) -- they never affect the KPI
-    numbers or the insight charts, which stay scoped to `days`. A
-    month_filter overrides the `days` scope for those two lists (so staff
-    can look up a specific past month regardless of which period button is
-    selected); name_filter is a case-insensitive substring match on the
-    patient's name, applied within whichever scope month_filter/days ends
-    up choosing.
+    name_filter / date_from / date_to narrow the two conversation LISTS
+    only (needs_attention, recent_conversations) -- they never affect the
+    KPI numbers or the insight charts, which stay scoped to `days`.
+    date_from/date_to (each "YYYY-MM-DD", either or both) pick an exact day
+    (set both to the same date) or an inclusive range, and OVERRIDE the
+    `days` scope for those two lists -- a clinic can have thousands of
+    conversations, so a day/range pick is exact rather than a coarse
+    monthly bucket. With no date given, name_filter searches the patient's
+    ENTIRE history rather than just the current `days` window -- a name
+    search that silently came back empty just because the match happened
+    to fall outside "last 7 days" is a search that doesn't work.
 
     This does more, smaller queries than a single giant SQL statement would
     need -- deliberately, so each piece stays readable and easy to adjust as
     the dashboard grows, rather than one query trying to do everything at
-    once. Clinic-scale data (dozens to low hundreds of conversations) makes
-    this a non-issue performance-wise.
+    once. Clinic-scale data (dozens to low hundreds of conversations per
+    period) makes this a non-issue performance-wise.
     """
     cutoff = _period_cutoff(days)
     name_filter_norm = (name_filter or "").strip().lower() or None
-    month_filter = (month_filter or "").strip() or None
+    from_dt = _parse_date(date_from)
+    to_dt = _parse_date(date_to)
+    has_date_range = bool(from_dt or to_dt)
 
     with db() as conn:
         # ---- Conversations in period (KPI + insight-chart scope) ----
@@ -209,8 +211,8 @@ def get_dashboard_summary(
                 outcome_no_booking += 1
 
         # ---- Conversations-by-month trend (last TREND_MONTHS calendar
-        # months) -- always this fixed window, independent of the days=
-        # period selector; it's a trend view, not a period KPI. ----
+        # months) -- always this fixed window, independent of every other
+        # filter on this page; it's a trend view, not a search result. ----
         now = datetime.now()
         month_keys = []
         y, m = now.year, now.month
@@ -237,41 +239,34 @@ def get_dashboard_summary(
                 "count": counts_by_ym.get(ym, 0),
             })
 
-        # ---- Months that actually have conversations, for the filter
-        # dropdown -- all-time, not period-scoped (staff should be able to
-        # jump to any past month regardless of the days= selector). ----
-        month_option_rows = conn.execute(
-            "SELECT DISTINCT substr(started_at, 1, 7) as ym FROM conversations "
-            "WHERE started_at IS NOT NULL ORDER BY ym DESC"
-        ).fetchall()
-        available_months = []
-        for r in month_option_rows:
-            ym = r["ym"]
-            if not ym or len(ym) != 7:
-                continue
-            try:
-                label = datetime.strptime(ym, "%Y-%m").strftime("%B %Y")
-            except ValueError:
-                continue
-            available_months.append({"value": ym, "label": label})
-
         # ---- The two filterable lists: needs-attention and recent
-        # conversations. A month_filter picks its own scope (that whole
-        # calendar month, regardless of `days`); otherwise they reuse the
-        # same days-scoped `conversations` already fetched above. Either
-        # way, name_filter then narrows by a case-insensitive substring
-        # match on the patient's name. ----
-        list_conversations = conversations
-        if month_filter:
-            m_start, m_end = _month_bounds(month_filter)
-            if m_start:
-                list_rows = conn.execute(
-                    "SELECT * FROM conversations WHERE started_at >= ? AND started_at < ? ORDER BY started_at DESC",
-                    (m_start, m_end),
-                ).fetchall()
-                list_conversations = [dict(r) for r in list_rows]
-            else:
-                month_filter = None  # malformed -- fall back to unfiltered scope silently
+        # conversations.
+        #   - A date range (date_from and/or date_to) picks its own exact
+        #     scope and overrides `days` for these two lists -- a specific
+        #     day (from==to), an open-ended "since", or a bounded range.
+        #   - No date range but a name_filter: search the clinic's WHOLE
+        #     history, not just the current `days` window -- see the
+        #     docstring above on why.
+        #   - Neither: reuse the same days-scoped `conversations` already
+        #     fetched above (the original, unfiltered behavior). ----
+        if has_date_range:
+            clauses, params = [], []
+            if from_dt:
+                clauses.append("started_at >= ?")
+                params.append(from_dt.isoformat())
+            if to_dt:
+                clauses.append("started_at < ?")
+                params.append((to_dt + timedelta(days=1)).isoformat())
+            where = " AND ".join(clauses)
+            list_rows = conn.execute(
+                f"SELECT * FROM conversations WHERE {where} ORDER BY started_at DESC", params
+            ).fetchall()
+            list_conversations = [dict(r) for r in list_rows]
+        elif name_filter_norm:
+            list_rows = conn.execute("SELECT * FROM conversations ORDER BY started_at DESC").fetchall()
+            list_conversations = [dict(r) for r in list_rows]
+        else:
+            list_conversations = conversations
 
         list_conv_ids = [c["id"] for c in list_conversations]
         list_message_count_by_conv: Dict[int, int] = {}
@@ -372,9 +367,9 @@ def get_dashboard_summary(
             "no_booking": outcome_no_booking,
         },
         "monthly_trend": monthly_trend,
-        "available_months": available_months,
         "filters": {
             "name": name_filter or "",
-            "month": month_filter or "",
+            "from": date_from if from_dt else "",
+            "to": date_to if to_dt else "",
         },
     }

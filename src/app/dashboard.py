@@ -48,6 +48,12 @@ PERIOD_CHOICES = [
     (0, "All time"),  # 0 here means "all time" -- see _days_param
 ]
 
+# Logo -- served from the /static mount main.py already sets up (see
+# main.py's STATIC_DIR / "static" mount, originally added for the
+# brochure image). One shared logo works fine across every clinic's
+# dashboard; it's Mawaid's own branding, not per-clinic.
+LOGO_URL = "/static/logo.png"
+
 # ---------------------------------------------------------------------
 # Chart colors -- from the validated reference palette (see the dataviz
 # skill's references/palette.md). Status colors for the outcome donut
@@ -102,7 +108,9 @@ def _get_clinic_or_404(slug: str) -> dict:
 PAGE_STYLE = """
 <style>
   body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
-  h1 { font-size: 22px; margin-bottom: 2px; }
+  .brand-row { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+  .brand-row img { width: 32px; height: 32px; border-radius: 7px; flex: none; }
+  h1 { font-size: 22px; margin: 0; }
   .subtitle { color: #666; font-size: 13px; margin-bottom: 18px; }
   h2 { font-size: 16px; margin-top: 30px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
   .periods { margin: 10px 0 4px 0; }
@@ -149,7 +157,8 @@ PAGE_STYLE = """
   .filter-bar { background: #f7f7f7; border-radius: 8px; padding: 12px 14px; margin: 16px 0 6px 0; }
   .filter-bar form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .filter-bar input[type=text] { padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; min-width: 180px; }
-  .filter-bar select { padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }
+  .filter-bar input[type=date] { padding: 5px 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }
+  .filter-bar .date-field { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #666; }
   .filter-bar button { padding: 6px 14px; border: none; border-radius: 6px; background: #1a7f37; color: white; font-size: 13px; cursor: pointer; }
   .filter-clear { font-size: 12px; color: #666; text-decoration: none; margin-left: 4px; }
   .filter-hint { font-size: 11px; color: #999; margin-top: 6px; }
@@ -172,15 +181,17 @@ def _fmt_money(value) -> str:
     return f"{value:,.0f} SAR"
 
 
-def _filter_query_suffix(name_filter: str, month_filter: str) -> str:
-    """&name=...&month=... fragment (possibly empty) for chaining onto
-    other query strings, so links (period switch, conversation view, back
-    button) don't silently drop the current filters."""
+def _filter_query_suffix(name_filter: str, date_from: str, date_to: str) -> str:
+    """&name=...&from=...&to=... fragment (possibly empty) for chaining
+    onto other query strings, so links (period switch, conversation view,
+    back button) don't silently drop the current filters."""
     parts = []
     if name_filter:
         parts.append(f"name={quote(name_filter)}")
-    if month_filter:
-        parts.append(f"month={quote(month_filter)}")
+    if date_from:
+        parts.append(f"from={quote(date_from)}")
+    if date_to:
+        parts.append(f"to={quote(date_to)}")
     return ("&" + "&".join(parts)) if parts else ""
 
 
@@ -325,8 +336,9 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
     kpis = data["kpis"]
     filters = data.get("filters", {})
     name_filter_val = filters.get("name", "")
-    month_filter_val = filters.get("month", "")
-    filter_qs = _filter_query_suffix(name_filter_val, month_filter_val)
+    date_from_val = filters.get("from", "")
+    date_to_val = filters.get("to", "")
+    filter_qs = _filter_query_suffix(name_filter_val, date_from_val, date_to_val)
 
     periods_html = ""
     for value, label in PERIOD_CHOICES:
@@ -366,27 +378,25 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
         today_html = '<div class="empty">No appointments scheduled for today.</div>'
 
     # Filter bar -- controls the two lists below it (needs attention +
-    # recent conversations). A month_filter looks across that whole
-    # calendar month regardless of the days= period buttons above.
-    month_options = '<option value="">All months</option>' + "".join(
-        f'<option value="{html.escape(m["value"])}"{" selected" if m["value"] == month_filter_val else ""}>'
-        f'{html.escape(m["label"])}</option>'
-        for m in data.get("available_months", [])
-    )
+    # recent conversations). A From/To date narrows to an exact day (set
+    # both the same) or a range, and overrides the period buttons above
+    # for these two lists only. A name search with no date searches the
+    # clinic's whole history, not just the current period.
     clear_link = (
         f'<a class="filter-clear" href="?days={days_param}">Clear filters</a>'
-        if (name_filter_val or month_filter_val) else ""
+        if (name_filter_val or date_from_val or date_to_val) else ""
     )
     filter_bar_html = f"""
   <div class="filter-bar">
     <form method="get">
       <input type="hidden" name="days" value="{days_param}">
       <input type="text" name="name" placeholder="Search patient name…" value="{html.escape(name_filter_val)}">
-      <select name="month">{month_options}</select>
+      <span class="date-field">From <input type="date" name="from" value="{html.escape(date_from_val)}"></span>
+      <span class="date-field">To <input type="date" name="to" value="{html.escape(date_to_val)}"></span>
       <button type="submit">Filter</button>
       {clear_link}
     </form>
-    <div class="filter-hint">Filters "Needs attention" and "Recent conversations" below. A month overrides the period buttons above for these two lists.</div>
+    <div class="filter-hint">Filters "Needs attention" and "Recent conversations" below. Set From and To to the same date for a single day. A name search with no date searches this clinic's whole history, not just the period buttons above.</div>
   </div>
 """
 
@@ -402,7 +412,7 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
                 f'<div class="attention-reason">{html.escape(a["reason"] or "No reason given.")}</div></div>'
             )
         attention_html = items
-    elif name_filter_val or month_filter_val:
+    elif name_filter_val or date_from_val or date_to_val:
         attention_html = '<div class="empty">Nothing flagged matches this filter.</div>'
     else:
         attention_html = '<div class="empty">Nothing flagged right now.</div>'
@@ -428,8 +438,8 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
             )
         recent_html = f'<table><tr><th>Started</th><th>Patient</th><th>WhatsApp</th><th>Messages</th><th>Outcome</th><th></th></tr>{rows}</table>'
         if data.get("recent_conversations_truncated"):
-            recent_html += f'<div class="truncated-note">Showing the most recent {len(data["recent_conversations"])} matches — narrow the filter to see more precisely.</div>'
-    elif name_filter_val or month_filter_val:
+            recent_html += f'<div class="truncated-note">Showing the most recent {len(data["recent_conversations"])} matches — narrow the filter (add a name, or a tighter date range) to see more precisely.</div>'
+    elif name_filter_val or date_from_val or date_to_val:
         recent_html = '<div class="empty">No conversations match this filter.</div>'
     else:
         recent_html = '<div class="empty">No conversations in this period.</div>'
@@ -475,7 +485,7 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
   {PAGE_STYLE}
 </head>
 <body>
-  <h1>🦷 {html.escape(clinic['name'])} — Sia Dashboard</h1>
+  <div class="brand-row"><img src="{LOGO_URL}" alt="Mawaid"><h1>{html.escape(clinic['name'])} — Sia Dashboard</h1></div>
   <div class="subtitle">{html.escape(data['period_label'])} · updated {_fmt_dt(data['generated_at'])} · refreshes automatically every 30s</div>
 
   <div class="periods">{periods_html}</div>
@@ -515,9 +525,9 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
 
 def _render_conversation_page(
     clinic: dict, conversation, patient, messages: list, booked: bool, days_param: int,
-    name_filter: str = "", month_filter: str = "",
+    name_filter: str = "", date_from: str = "", date_to: str = "",
 ) -> str:
-    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{_filter_query_suffix(name_filter, month_filter)}'
+    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{_filter_query_suffix(name_filter, date_from, date_to)}'
 
     if conversation.flagged_for_staff:
         flag_banner = (
@@ -558,6 +568,7 @@ def _render_conversation_page(
   {PAGE_STYLE}
 </head>
 <body>
+  <div class="brand-row"><img src="{LOGO_URL}" alt="Mawaid"></div>
   <a class="back-link" href="{back_url}">&larr; Back to dashboard</a>
   <h1>💬 {html.escape(patient.name if patient else 'Unknown patient')}</h1>
   <div class="conv-meta">
@@ -575,7 +586,9 @@ def _render_conversation_page(
 @router.get("/clinic/{slug}/dashboard/conversation/{conversation_id}", response_class=HTMLResponse)
 async def clinic_dashboard_conversation(
     slug: str, conversation_id: int, days: int = Query(7),
-    name: Optional[str] = Query(None), month: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
@@ -608,35 +621,39 @@ async def clinic_dashboard_conversation(
             booked = booked_row is not None
 
     return HTMLResponse(_render_conversation_page(
-        clinic, conversation, patient, messages, booked, days, name or "", month or "",
+        clinic, conversation, patient, messages, booked, days, name or "", date_from or "", date_to or "",
     ))
 
 
 @router.get("/clinic/{slug}/dashboard", response_class=HTMLResponse)
 async def clinic_dashboard(
     slug: str, days: int = Query(7),
-    name: Optional[str] = Query(None), month: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
     require_dashboard_auth(clinic, credentials)
 
     db.set_current_db_path(clinic["db_path"])
-    data = analytics.get_dashboard_summary(days=_days_param(days), name_filter=name, month_filter=month)
+    data = analytics.get_dashboard_summary(days=_days_param(days), name_filter=name, date_from=date_from, date_to=date_to)
     return HTMLResponse(_render_page(clinic, data, days))
 
 
 @router.get("/clinic/{slug}/api/dashboard")
 async def clinic_dashboard_api(
     slug: str, days: int = Query(7),
-    name: Optional[str] = Query(None), month: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
     require_dashboard_auth(clinic, credentials)
 
     db.set_current_db_path(clinic["db_path"])
-    data = analytics.get_dashboard_summary(days=_days_param(days), name_filter=name, month_filter=month)
+    data = analytics.get_dashboard_summary(days=_days_param(days), name_filter=name, date_from=date_from, date_to=date_to)
     return {
         "clinic": {"name": clinic["name"], "slug": clinic["slug"]},
         **data,

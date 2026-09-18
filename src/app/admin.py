@@ -144,7 +144,9 @@ def _subscribe_waba(waba_id: str, access_token: str) -> dict:
 PAGE_STYLE = """
 <style>
   body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
-  h1 { font-size: 22px; }
+  .brand-row { display: flex; align-items: center; gap: 10px; }
+  .brand-row img { width: 32px; height: 32px; border-radius: 7px; flex: none; }
+  h1 { font-size: 22px; margin: 0; }
   h2 { font-size: 18px; margin-top: 36px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
   table { border-collapse: collapse; width: 100%; margin-top: 8px; }
   th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }
@@ -205,7 +207,7 @@ def _render_page(message_html: str = "") -> str:
 <html>
 <head><meta charset="utf-8"><title>Mawaid — Clinics</title>{PAGE_STYLE}</head>
 <body>
-  <h1>🦷 Mawaid — Clinics running on this service</h1>
+  <div class="brand-row"><img src="/static/logo.png" alt="Mawaid"><h1>🦷 Mawaid — Clinics running on this service</h1></div>
   {message_html}
 
   <h2>Current clinics</h2>
