@@ -89,10 +89,10 @@ def get_dashboard_summary(
     Builds everything the staff dashboard shows, in one call: top-line KPIs,
     today's live schedule, conversations needing staff attention, a recent
     conversations feed (including patients who reached out but never
-    booked), the most-requested services, message volume by hour of day,
-    a conversation-outcomes breakdown, and a 6-month conversation-volume
-    trend -- all scoped to the last `days` days, or all-time if `days` is
-    None.
+    booked), the most-requested services, bookings broken down by doctor
+    and by specialty, message volume by hour of day, a conversation-outcomes
+    breakdown, and a 6-month conversation-volume trend -- all scoped to the
+    last `days` days, or all-time if `days` is None.
 
     name_filter / date_from / date_to narrow the two conversation LISTS
     only (needs_attention, recent_conversations) -- they never affect the
@@ -354,6 +354,31 @@ def get_dashboard_summary(
         service_counter = Counter(a["service_name"] for a in appointments if a["service_name"])
         top_services = [{"service_name": name, "count": count} for name, count in service_counter.most_common(8)]
 
+        # ---- Bookings by doctor / by specialty -- same spirit as
+        # top_services above (all bookings in period, including cancelled,
+        # so the charts agree on what counts as a "booking"), just grouped
+        # by who did the booking instead of what was booked. Lets a clinic
+        # see which dentist/specialty is getting the volume. A small,
+        # clinic-wide lookup -- one query covers every appointment here. ----
+        dentist_rows = conn.execute("SELECT id, name, specialization FROM dentists").fetchall()
+        dentist_lookup = {d["id"]: {"name": d["name"], "specialization": d["specialization"]} for d in dentist_rows}
+        doctor_counter = Counter()
+        specialty_counter = Counter()
+        for a in appointments:
+            dentist = dentist_lookup.get(a["dentist_id"])
+            if not dentist:
+                continue
+            doctor_counter[(dentist["name"], dentist["specialization"])] += 1
+            if dentist["specialization"]:
+                specialty_counter[dentist["specialization"]] += 1
+        top_doctors = [
+            {"dentist_name": name, "specialization": spec, "count": count}
+            for (name, spec), count in doctor_counter.most_common(8)
+        ]
+        top_specialties = [
+            {"specialization": spec, "count": count} for spec, count in specialty_counter.most_common(8)
+        ]
+
         # ---- Estimated revenue booked: sum of prices on non-cancelled
         # bookings in period. An estimate of pipeline value, NOT confirmed
         # or collected revenue -- it has no idea about no-shows or whether
@@ -386,6 +411,8 @@ def get_dashboard_summary(
         "recent_conversations": recent_conversations,
         "recent_conversations_truncated": recent_truncated,
         "top_services": top_services,
+        "top_doctors": top_doctors,
+        "top_specialties": top_specialties,
         "hourly_distribution": [{"hour": h, "message_count": hourly.get(h, 0)} for h in range(24)],
         "outcome_breakdown": {
             "booked": outcome_booked,

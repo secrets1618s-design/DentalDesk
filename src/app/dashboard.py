@@ -115,6 +115,16 @@ TRANSLATIONS = {
     "h2_needs_attention": {"en": "Needs attention", "ar": "بحاجة لمتابعة"},
     "h2_recent": {"en": "Recent conversations", "ar": "المحادثات الأخيرة"},
     "h2_services": {"en": "Most requested services", "ar": "الخدمات الأكثر طلبًا"},
+    "h2_doctors": {"en": "Bookings by doctor", "ar": "الحجوزات حسب الطبيب"},
+    "h2_specialties": {"en": "Bookings by specialty", "ar": "الحجوزات حسب التخصص"},
+    "doctors_empty": {
+        "en": "No bookings yet to break down by doctor.",
+        "ar": "لا توجد حجوزات بعد لتصنيفها حسب الطبيب.",
+    },
+    "specialties_empty": {
+        "en": "No bookings yet to break down by specialty.",
+        "ar": "لا توجد حجوزات بعد لتصنيفها حسب التخصص.",
+    },
     "h2_hourly": {"en": "Message volume by hour of day", "ar": "حجم الرسائل حسب ساعة اليوم"},
     "outcome_booked": {"en": "Booked", "ar": "تم الحجز"},
     "outcome_flagged": {"en": "Flagged for staff", "ar": "بحاجة لمتابعة الموظفين"},
@@ -426,15 +436,17 @@ def _svg_bar_chart(
 
 def _svg_hbar_chart(
     items, *, value_key: str, label_key: str, width: int = 700, bar_h: int = 18, gap: int = 12,
-    bar_color: str = CHART_BLUE, value_fmt=None,
+    bar_color: str = CHART_BLUE, value_fmt=None, label_w: int = 150,
 ) -> str:
     """Horizontal bar chart -- for magnitude comparisons with longer text
-    labels (service names) that would collide as vertical-bar x-labels."""
+    labels (service names) that would collide as vertical-bar x-labels.
+    label_w is overridable per call -- a doctor-name-plus-specialty label
+    ("Dr. Fatima Al-Zahrani (Orthodontics)") needs more room than a bare
+    service name before it starts clipping."""
     if not items:
         return '<div class="empty">Not enough data yet.</div>'
     value_fmt = value_fmt or (lambda v: str(v))
     max_val = max((i[value_key] for i in items), default=0) or 1
-    label_w = 150
     right_pad = 48
     plot_w = max(width - label_w - right_pad, 40)
     height = len(items) * (bar_h + gap) + gap
@@ -699,6 +711,29 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
     if not data["top_services"]:
         services_html = f'<div class="empty">{_t("services_empty", lang)}</div>'
 
+    # Bookings by doctor -- horizontal bar chart; label combines name +
+    # specialty so the chart is legible on its own, without a separate
+    # legend mapping doctor to specialty.
+    doctor_items = [
+        {
+            "label": f'{d["dentist_name"]} ({d["specialization"]})' if d["specialization"] else d["dentist_name"],
+            "count": d["count"],
+        }
+        for d in data.get("top_doctors", [])
+    ]
+    doctors_html = _svg_hbar_chart(doctor_items, value_key="count", label_key="label", bar_color=CHART_BLUE, label_w=260)
+    if not doctor_items:
+        doctors_html = f'<div class="empty">{_t("doctors_empty", lang)}</div>'
+
+    # Bookings by specialty -- horizontal bar chart, same period/counting
+    # as top_services and top_doctors above (all bookings in period,
+    # including cancelled).
+    specialties_html = _svg_hbar_chart(
+        data.get("top_specialties", []), value_key="count", label_key="specialization", bar_color=CHART_BLUE,
+    )
+    if not data.get("top_specialties"):
+        specialties_html = f'<div class="empty">{_t("specialties_empty", lang)}</div>'
+
     # Message volume by hour of day -- vertical bar chart, values hidden
     # (24 direct labels would be clutter -- the hover tooltip has the
     # exact count) and hour labels shown every 3 hours.
@@ -750,6 +785,12 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
 
   <h2>{_t('h2_services', lang)}</h2>
   {services_html}
+
+  <h2>{_t('h2_doctors', lang)}</h2>
+  {doctors_html}
+
+  <h2>{_t('h2_specialties', lang)}</h2>
+  {specialties_html}
 
   <h2>{_t('h2_hourly', lang)}</h2>
   {hourly_html}
