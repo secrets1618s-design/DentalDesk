@@ -78,3 +78,8 @@ data/control.db*
 data/clinics/
 logs/
 .gemini/
+
+# Scratch patch/bundle files used to sync changes between machines/sessions --
+# not meant to live in the repo permanently.
+*.patch
+*.bundle
