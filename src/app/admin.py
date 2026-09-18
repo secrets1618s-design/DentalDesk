@@ -144,8 +144,8 @@ def _subscribe_waba(waba_id: str, access_token: str) -> dict:
 PAGE_STYLE = """
 <style>
   body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
-  .brand-row { display: flex; align-items: center; gap: 10px; }
-  .brand-row img { width: 32px; height: 32px; border-radius: 7px; flex: none; }
+  .brand-row { display: flex; align-items: center; gap: 16px; }
+  .brand-row img { width: 128px; height: 128px; border-radius: 24px; flex: none; }
   h1 { font-size: 22px; margin: 0; }
   h2 { font-size: 18px; margin-top: 36px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
   table { border-collapse: collapse; width: 100%; margin-top: 8px; }

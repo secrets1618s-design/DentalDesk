@@ -108,8 +108,8 @@ def _get_clinic_or_404(slug: str) -> dict:
 PAGE_STYLE = """
 <style>
   body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #1a1a1a; }
-  .brand-row { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
-  .brand-row img { width: 32px; height: 32px; border-radius: 7px; flex: none; }
+  .brand-row { display: flex; align-items: center; gap: 16px; margin-bottom: 6px; }
+  .brand-row img { width: 128px; height: 128px; border-radius: 24px; flex: none; }
   h1 { font-size: 22px; margin: 0; }
   .subtitle { color: #666; font-size: 13px; margin-bottom: 18px; }
   h2 { font-size: 16px; margin-top: 30px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }
