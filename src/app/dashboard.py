@@ -109,6 +109,17 @@ PAGE_STYLE = """
   .attention-reason { font-size: 13px; margin-top: 4px; }
   .api-hint { color: #666; font-size: 12px; margin-top: 30px; padding-top: 10px; border-top: 1px solid #eee; }
   .api-hint code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; }
+  .back-link { display: inline-block; margin-bottom: 10px; font-size: 13px; color: #1a7f37; text-decoration: none; }
+  .conv-meta { color: #666; font-size: 13px; margin-bottom: 16px; }
+  .transcript { margin-top: 10px; }
+  .bubble-row { display: flex; margin-bottom: 10px; }
+  .bubble-row.patient { justify-content: flex-start; }
+  .bubble-row.sia { justify-content: flex-end; }
+  .bubble { max-width: 65%; padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; }
+  .bubble-row.patient .bubble { background: #f0f0f0; color: #1a1a1a; border-bottom-left-radius: 3px; }
+  .bubble-row.sia .bubble { background: #dcf3e3; color: #14532d; border-bottom-right-radius: 3px; }
+  .bubble-time { font-size: 10px; color: #999; margin-top: 3px; }
+  .view-link { font-size: 12px; }
 </style>
 """
 
@@ -171,9 +182,11 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
     if data["needs_attention"]:
         items = ""
         for a in data["needs_attention"]:
+            conv_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{a["conversation_id"]}?days={days_param}'
             items += (
                 f'<div class="attention-item"><b>{html.escape(a["patient_name"] or "Unknown")}</b> '
-                f'({html.escape(a["phone_number"] or "no number")}) — {_fmt_dt(a["started_at"])}'
+                f'({html.escape(a["phone_number"] or "no number")}) — {_fmt_dt(a["started_at"])} '
+                f'— <a class="view-link" href="{conv_url}">View conversation</a>'
                 f'<div class="attention-reason">{html.escape(a["reason"] or "No reason given.")}</div></div>'
             )
         attention_html = items
@@ -190,14 +203,16 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
                 booked_badge = '<span class="badge badge-yes">booked</span>'
             else:
                 booked_badge = '<span class="badge badge-no">no booking</span>'
+            conv_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{c["conversation_id"]}?days={days_param}'
             rows += (
                 f'<tr><td>{_fmt_dt(c["started_at"])}</td>'
                 f'<td>{html.escape(c["patient_name"] or "Unknown")}</td>'
                 f'<td>{html.escape(c["phone_number"] or "")}</td>'
                 f'<td>{c["message_count"]}</td>'
-                f'<td>{booked_badge}</td></tr>'
+                f'<td>{booked_badge}</td>'
+                f'<td><a class="view-link" href="{conv_url}">View</a></td></tr>'
             )
-        recent_html = f'<table><tr><th>Started</th><th>Patient</th><th>WhatsApp</th><th>Messages</th><th>Outcome</th></tr>{rows}</table>'
+        recent_html = f'<table><tr><th>Started</th><th>Patient</th><th>WhatsApp</th><th>Messages</th><th>Outcome</th><th></th></tr>{rows}</table>'
     else:
         recent_html = '<div class="empty">No conversations in this period.</div>'
 
@@ -264,6 +279,98 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
   </div>
 </body>
 </html>"""
+
+
+def _render_conversation_page(clinic: dict, conversation, patient, messages: list, booked: bool, days_param: int) -> str:
+    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}'
+
+    if conversation.flagged_for_staff:
+        flag_banner = (
+            f'<div class="attention-item"><b>Flagged for staff</b>'
+            f'<div class="attention-reason">{html.escape(conversation.flag_reason or "No reason given.")}</div></div>'
+        )
+    else:
+        flag_banner = ""
+
+    outcome_badge = '<span class="badge badge-yes">Booked during this conversation</span>' if booked \
+        else '<span class="badge badge-no">No booking made</span>'
+
+    # Only the human-readable half of the transcript -- "tool"/"agent_tool_call"
+    # rows are Sia's internal tool calls (booking lookups, etc.), not something
+    # a patient saw or a receptionist needs to read to understand the chat.
+    visible_messages = [m for m in messages if m.sender in ("user", "agent")]
+
+    if visible_messages:
+        bubbles = ""
+        for m in visible_messages:
+            side = "patient" if m.sender == "user" else "sia"
+            speaker = (patient.name if patient else "Patient") if side == "patient" else "Sia"
+            bubbles += (
+                f'<div class="bubble-row {side}"><div>'
+                f'<div class="bubble">{html.escape(m.message)}</div>'
+                f'<div class="bubble-time">{html.escape(speaker)} · {_fmt_dt(str(m.created_at))}</div>'
+                f'</div></div>'
+            )
+        transcript_html = bubbles
+    else:
+        transcript_html = '<div class="empty">No messages in this conversation.</div>'
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Conversation — {html.escape(patient.name if patient else 'Unknown')} — {html.escape(clinic['name'])}</title>
+  {PAGE_STYLE}
+</head>
+<body>
+  <a class="back-link" href="{back_url}">&larr; Back to dashboard</a>
+  <h1>💬 {html.escape(patient.name if patient else 'Unknown patient')}</h1>
+  <div class="conv-meta">
+    {html.escape(patient.phone_number if patient else '')} · started {_fmt_dt(str(conversation.started_at))}
+    · status: {html.escape(conversation.status)} · {outcome_badge}
+  </div>
+
+  {flag_banner}
+
+  <div class="transcript">{transcript_html}</div>
+</body>
+</html>"""
+
+
+@router.get("/clinic/{slug}/dashboard/conversation/{conversation_id}", response_class=HTMLResponse)
+async def clinic_dashboard_conversation(
+    slug: str, conversation_id: int, days: int = Query(7), credentials: HTTPBasicCredentials = Depends(security)
+):
+    clinic = _get_clinic_or_404(slug)
+    require_dashboard_auth(clinic, credentials)
+
+    db.set_current_db_path(clinic["db_path"])
+    conversation = db.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="No such conversation")
+
+    patient = db.get_patient(conversation.patient_id) if conversation.patient_id else None
+    messages = db.get_messages(conversation_id)
+
+    booked = False
+    if conversation.patient_id is not None:
+        with db.db() as conn:
+            booked_row = conn.execute(
+                """
+                SELECT 1 FROM appointments
+                WHERE patient_id = ? AND created_at IS NOT NULL AND created_at >= ?
+                  AND (? IS NULL OR created_at <= ?)
+                LIMIT 1
+                """,
+                (
+                    conversation.patient_id, conversation.started_at.isoformat(),
+                    conversation.ended_at.isoformat() if conversation.ended_at else None,
+                    conversation.ended_at.isoformat() if conversation.ended_at else None,
+                ),
+            ).fetchone()
+            booked = booked_row is not None
+
+    return HTMLResponse(_render_conversation_page(clinic, conversation, patient, messages, booked, days))
 
 
 @router.get("/clinic/{slug}/dashboard", response_class=HTMLResponse)
