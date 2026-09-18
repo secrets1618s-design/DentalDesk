@@ -596,6 +596,7 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
                 f'<td>{html.escape(a["patient_name"] or "")}</td>'
                 f'<td>{_fmt_age(a["patient_age"])}</td>'
                 f'<td>{_fmt_gender(a["patient_gender"], lang)}</td>'
+                f'<td>{html.escape(a["phone_number"] or "")}</td>'
                 f'<td>{html.escape(a["dentist_name"] or "")}</td>'
                 f'<td>{html.escape(a["service_name"] or "—")}</td>'
                 f'<td>{badge}</td></tr>'
@@ -603,6 +604,7 @@ def _render_page(clinic: dict, data: dict, days_param: int, sched_param: str = "
         schedule_html = (
             f'<table><tr><th>{_t("col_time", lang)}</th><th>{_t("col_patient", lang)}</th>'
             f'<th>{_t("col_age", lang)}</th><th>{_t("col_gender", lang)}</th>'
+            f'<th>{_t("col_whatsapp", lang)}</th>'
             f'<th>{_t("col_dentist", lang)}</th><th>{_t("col_service", lang)}</th>'
             f'<th>{_t("col_status", lang)}</th></tr>{rows}</table>'
         )
