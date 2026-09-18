@@ -27,6 +27,17 @@ from shared.db import db
 
 logger = logging.getLogger(__name__)
 
+# How many rows the (possibly filtered) recent-conversations feed will
+# return at most. Generous enough to browse a whole month's conversations
+# for a normal-size clinic; a name/month filter narrows well below this
+# in practice.
+RECENT_CONVERSATIONS_CAP = 100
+
+# How many trailing calendar months the "conversations by month" chart
+# covers. Independent of the days= period selector -- it's a trend view,
+# not a period-scoped KPI.
+TREND_MONTHS = 6
+
 
 def _period_cutoff(days: Optional[int]) -> Optional[str]:
     """None means all-time (no cutoff). Otherwise an ISO timestamp for
@@ -36,13 +47,63 @@ def _period_cutoff(days: Optional[int]) -> Optional[str]:
     return (datetime.now() - timedelta(days=days)).isoformat()
 
 
-def get_dashboard_summary(days: Optional[int] = 7) -> Dict[str, Any]:
+def _month_bounds(month_str: str):
+    """'2026-09' -> (iso start of month, iso start of next month), or
+    (None, None) if month_str isn't a well-formed YYYY-MM string (a bad
+    query param shouldn't 500 the dashboard -- it just falls back to
+    unfiltered)."""
+    try:
+        year, month = int(month_str[:4]), int(month_str[5:7])
+        if not (1 <= month <= 12) or month_str[4] != "-":
+            raise ValueError
+    except (ValueError, IndexError, TypeError):
+        return None, None
+    start = datetime(year, month, 1)
+    end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+    return start.isoformat(), end.isoformat()
+
+
+def _booked_during(conn, patient_id: Optional[int], started_at: str, ended_at: Optional[str]) -> bool:
+    """Heuristic: did this patient have an appointment created during this
+    conversation's own timeframe (its started_at through its ended_at, or
+    through now if still open)? Good enough for a front-desk feed; not
+    meant as an exact attribution system."""
+    if patient_id is None:
+        return False
+    row = conn.execute(
+        """
+        SELECT 1 FROM appointments
+        WHERE patient_id = ? AND created_at IS NOT NULL AND created_at >= ?
+          AND (? IS NULL OR created_at <= ?)
+        LIMIT 1
+        """,
+        (patient_id, started_at, ended_at, ended_at),
+    ).fetchone()
+    return row is not None
+
+
+def get_dashboard_summary(
+    days: Optional[int] = 7,
+    name_filter: Optional[str] = None,
+    month_filter: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Builds everything the staff dashboard shows, in one call: top-line KPIs,
     today's live schedule, conversations needing staff attention, a recent
     conversations feed (including patients who reached out but never
-    booked), the most-requested services, and message volume by hour of day
-    -- all scoped to the last `days` days, or all-time if `days` is None.
+    booked), the most-requested services, message volume by hour of day,
+    a conversation-outcomes breakdown, and a 6-month conversation-volume
+    trend -- all scoped to the last `days` days, or all-time if `days` is
+    None.
+
+    name_filter / month_filter narrow the two conversation LISTS only
+    (needs_attention, recent_conversations) -- they never affect the KPI
+    numbers or the insight charts, which stay scoped to `days`. A
+    month_filter overrides the `days` scope for those two lists (so staff
+    can look up a specific past month regardless of which period button is
+    selected); name_filter is a case-insensitive substring match on the
+    patient's name, applied within whichever scope month_filter/days ends
+    up choosing.
 
     This does more, smaller queries than a single giant SQL statement would
     need -- deliberately, so each piece stays readable and easy to adjust as
@@ -51,9 +112,11 @@ def get_dashboard_summary(days: Optional[int] = 7) -> Dict[str, Any]:
     this a non-issue performance-wise.
     """
     cutoff = _period_cutoff(days)
+    name_filter_norm = (name_filter or "").strip().lower() or None
+    month_filter = (month_filter or "").strip() or None
 
     with db() as conn:
-        # ---- Conversations in period ----
+        # ---- Conversations in period (KPI + insight-chart scope) ----
         if cutoff:
             conv_rows = conn.execute(
                 "SELECT * FROM conversations WHERE started_at >= ? ORDER BY started_at DESC", (cutoff,)
@@ -131,53 +194,137 @@ def get_dashboard_summary(days: Optional[int] = 7) -> Dict[str, Any]:
         ).fetchall()
         today_appointments = [dict(r) for r in today_rows]
 
-        # ---- Needs attention: flagged conversations ----
+        # ---- Conversation outcomes -- booked / flagged / no booking, over
+        # the FULL period (not capped), for the donut chart. Mirrors the
+        # same booked-heuristic and flagged-takes-precedence rule the
+        # recent-conversations feed uses below, so the chart and the list
+        # never disagree about what counts as what. ----
+        outcome_booked = outcome_flagged = outcome_no_booking = 0
+        for c in conversations:
+            if c["flagged_for_staff"]:
+                outcome_flagged += 1
+            elif _booked_during(conn, c["patient_id"], c["started_at"], c["ended_at"]):
+                outcome_booked += 1
+            else:
+                outcome_no_booking += 1
+
+        # ---- Conversations-by-month trend (last TREND_MONTHS calendar
+        # months) -- always this fixed window, independent of the days=
+        # period selector; it's a trend view, not a period KPI. ----
+        now = datetime.now()
+        month_keys = []
+        y, m = now.year, now.month
+        for _ in range(TREND_MONTHS):
+            month_keys.append((y, m))
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+        month_keys.reverse()
+        trend_cutoff = datetime(month_keys[0][0], month_keys[0][1], 1).isoformat()
+        trend_rows = conn.execute(
+            "SELECT substr(started_at, 1, 7) as ym, COUNT(*) as cnt FROM conversations "
+            "WHERE started_at >= ? GROUP BY ym",
+            (trend_cutoff,),
+        ).fetchall()
+        counts_by_ym = {r["ym"]: r["cnt"] for r in trend_rows}
+        monthly_trend = []
+        for (y, m) in month_keys:
+            ym = f"{y:04d}-{m:02d}"
+            monthly_trend.append({
+                "month": ym,
+                "label": datetime(y, m, 1).strftime("%b"),
+                "count": counts_by_ym.get(ym, 0),
+            })
+
+        # ---- Months that actually have conversations, for the filter
+        # dropdown -- all-time, not period-scoped (staff should be able to
+        # jump to any past month regardless of the days= selector). ----
+        month_option_rows = conn.execute(
+            "SELECT DISTINCT substr(started_at, 1, 7) as ym FROM conversations "
+            "WHERE started_at IS NOT NULL ORDER BY ym DESC"
+        ).fetchall()
+        available_months = []
+        for r in month_option_rows:
+            ym = r["ym"]
+            if not ym or len(ym) != 7:
+                continue
+            try:
+                label = datetime.strptime(ym, "%Y-%m").strftime("%B %Y")
+            except ValueError:
+                continue
+            available_months.append({"value": ym, "label": label})
+
+        # ---- The two filterable lists: needs-attention and recent
+        # conversations. A month_filter picks its own scope (that whole
+        # calendar month, regardless of `days`); otherwise they reuse the
+        # same days-scoped `conversations` already fetched above. Either
+        # way, name_filter then narrows by a case-insensitive substring
+        # match on the patient's name. ----
+        list_conversations = conversations
+        if month_filter:
+            m_start, m_end = _month_bounds(month_filter)
+            if m_start:
+                list_rows = conn.execute(
+                    "SELECT * FROM conversations WHERE started_at >= ? AND started_at < ? ORDER BY started_at DESC",
+                    (m_start, m_end),
+                ).fetchall()
+                list_conversations = [dict(r) for r in list_rows]
+            else:
+                month_filter = None  # malformed -- fall back to unfiltered scope silently
+
+        list_conv_ids = [c["id"] for c in list_conversations]
+        list_message_count_by_conv: Dict[int, int] = {}
+        if list_conv_ids:
+            placeholders = ",".join("?" for _ in list_conv_ids)
+            for row in conn.execute(
+                f"SELECT conversation_id, COUNT(*) as cnt FROM messages "
+                f"WHERE conversation_id IN ({placeholders}) GROUP BY conversation_id",
+                list_conv_ids,
+            ).fetchall():
+                list_message_count_by_conv[row["conversation_id"]] = row["cnt"]
+
+        def _patient_name_and_phone(patient_id):
+            if patient_id is None:
+                return "Unknown", None
+            row = conn.execute("SELECT name, phone_number FROM patients WHERE id=?", (patient_id,)).fetchone()
+            if not row:
+                return "Unknown", None
+            return row["name"] or "Unknown", row["phone_number"]
+
         needs_attention = []
-        for c in flagged:
-            patient = conn.execute(
-                "SELECT name, phone_number FROM patients WHERE id=?", (c["patient_id"],)
-            ).fetchone()
+        for c in [c for c in list_conversations if c["flagged_for_staff"]]:
+            pname, pphone = _patient_name_and_phone(c["patient_id"])
+            if name_filter_norm and name_filter_norm not in pname.lower():
+                continue
             needs_attention.append({
                 "conversation_id": c["id"],
-                "patient_name": patient["name"] if patient else "Unknown",
-                "phone_number": patient["phone_number"] if patient else None,
+                "patient_name": pname,
+                "phone_number": pphone,
                 "reason": c["flag_reason"],
                 "started_at": c["started_at"],
                 "status": c["status"],
             })
         needs_attention.sort(key=lambda x: x["started_at"], reverse=True)
 
-        # ---- Recent conversations feed, including leads that never booked
-        # -- this is the "who reached out and didn't book" view. "booked"
-        # is a heuristic: did this patient have an appointment created
-        # during this conversation's own timeframe (its started_at through
-        # its ended_at, or through now if still open)? Good enough for a
-        # front-desk feed; not meant as an exact attribution system. ----
         recent_conversations = []
-        for c in conversations[:50]:
-            patient = conn.execute(
-                "SELECT name, phone_number FROM patients WHERE id=?", (c["patient_id"],)
-            ).fetchone()
-            booked = False
-            if c["patient_id"] is not None:
-                booked_row = conn.execute(
-                    """
-                    SELECT 1 FROM appointments
-                    WHERE patient_id = ? AND created_at IS NOT NULL AND created_at >= ?
-                      AND (? IS NULL OR created_at <= ?)
-                    LIMIT 1
-                    """,
-                    (c["patient_id"], c["started_at"], c["ended_at"], c["ended_at"]),
-                ).fetchone()
-                booked = booked_row is not None
+        recent_truncated = False
+        for c in list_conversations:
+            pname, pphone = _patient_name_and_phone(c["patient_id"])
+            if name_filter_norm and name_filter_norm not in pname.lower():
+                continue
+            if len(recent_conversations) >= RECENT_CONVERSATIONS_CAP:
+                recent_truncated = True
+                break
+            booked = _booked_during(conn, c["patient_id"], c["started_at"], c["ended_at"])
             recent_conversations.append({
                 "conversation_id": c["id"],
-                "patient_name": patient["name"] if patient else "Unknown",
-                "phone_number": patient["phone_number"] if patient else None,
+                "patient_name": pname,
+                "phone_number": pphone,
                 "started_at": c["started_at"],
                 "ended_at": c["ended_at"],
                 "status": c["status"],
-                "message_count": message_count_by_conv.get(c["id"], 0),
+                "message_count": list_message_count_by_conv.get(c["id"], 0),
                 "flagged": bool(c["flagged_for_staff"]),
                 "booked": booked,
             })
@@ -216,6 +363,18 @@ def get_dashboard_summary(days: Optional[int] = 7) -> Dict[str, Any]:
         "today_appointments": today_appointments,
         "needs_attention": needs_attention,
         "recent_conversations": recent_conversations,
+        "recent_conversations_truncated": recent_truncated,
         "top_services": top_services,
         "hourly_distribution": [{"hour": h, "message_count": hourly.get(h, 0)} for h in range(24)],
+        "outcome_breakdown": {
+            "booked": outcome_booked,
+            "flagged": outcome_flagged,
+            "no_booking": outcome_no_booking,
+        },
+        "monthly_trend": monthly_trend,
+        "available_months": available_months,
+        "filters": {
+            "name": name_filter or "",
+            "month": month_filter or "",
+        },
     }

@@ -16,14 +16,19 @@ Two endpoints per clinic, both requiring auth (see require_dashboard_auth):
 
 Kept as plain server-rendered HTML with a page auto-refresh, same spirit as
 admin.py -- no build step, no JS framework, nothing to break on an old
-front-desk PC. See claude/staff-dashboard.md for what's covered and what
-isn't (no-show tracking, CSAT, etc. -- deliberately left for later).
+front-desk PC. Charts are plain inline SVG generated server-side (no chart
+library, no client-side JS at all) -- hover tooltips come for free from
+native SVG <title> elements. See claude/staff-dashboard.md for what's
+covered and what isn't (no-show tracking, CSAT, etc. -- deliberately left
+for later).
 """
 import os
+import math
 import html
 import logging
 import secrets as _secrets
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -42,6 +47,22 @@ PERIOD_CHOICES = [
     (30, "30 days"),
     (0, "All time"),  # 0 here means "all time" -- see _days_param
 ]
+
+# ---------------------------------------------------------------------
+# Chart colors -- from the validated reference palette (see the dataviz
+# skill's references/palette.md). Status colors for the outcome donut
+# (booked/flagged/no-booking are states, not arbitrary categories); a
+# single sequential blue for magnitude bars (volume by month, by hour,
+# by service).
+# ---------------------------------------------------------------------
+CHART_BLUE = "#2a78d6"
+STATUS_GOOD = "#0ca30c"
+STATUS_WARNING = "#fab219"
+STATUS_MUTED = "#898781"
+INK_PRIMARY = "#0b0b0b"
+INK_SECONDARY = "#52514e"
+INK_MUTED = "#898781"
+BASELINE = "#c3c2b7"
 
 
 def _days_param(days: int) -> Optional[int]:
@@ -120,6 +141,19 @@ PAGE_STYLE = """
   .bubble-row.sia .bubble { background: #dcf3e3; color: #14532d; border-bottom-right-radius: 3px; }
   .bubble-time { font-size: 10px; color: #999; margin-top: 3px; }
   .view-link { font-size: 12px; }
+  .chart-wrap { margin: 10px 0 20px 0; }
+  .donut-wrap { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; margin: 10px 0 20px 0; }
+  .legend { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+  .filter-bar { background: #f7f7f7; border-radius: 8px; padding: 12px 14px; margin: 16px 0 6px 0; }
+  .filter-bar form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .filter-bar input[type=text] { padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; min-width: 180px; }
+  .filter-bar select { padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }
+  .filter-bar button { padding: 6px 14px; border: none; border-radius: 6px; background: #1a7f37; color: white; font-size: 13px; cursor: pointer; }
+  .filter-clear { font-size: 12px; color: #666; text-decoration: none; margin-left: 4px; }
+  .filter-hint { font-size: 11px; color: #999; margin-top: 6px; }
+  .truncated-note { font-size: 12px; color: #999; margin-top: 6px; }
 </style>
 """
 
@@ -138,13 +172,166 @@ def _fmt_money(value) -> str:
     return f"{value:,.0f} SAR"
 
 
+def _filter_query_suffix(name_filter: str, month_filter: str) -> str:
+    """&name=...&month=... fragment (possibly empty) for chaining onto
+    other query strings, so links (period switch, conversation view, back
+    button) don't silently drop the current filters."""
+    parts = []
+    if name_filter:
+        parts.append(f"name={quote(name_filter)}")
+    if month_filter:
+        parts.append(f"month={quote(month_filter)}")
+    return ("&" + "&".join(parts)) if parts else ""
+
+
+def _svg_bar_chart(
+    items, *, value_key: str, label_key: str, width: int = 760, height: int = 180,
+    bar_color: str = CHART_BLUE, value_fmt=None, show_values: bool = True, label_every: int = 1,
+) -> str:
+    """Vertical bar chart: <=24px bars, 4px rounded data-ends, single
+    baseline, sparing direct labels (per marks-and-anatomy.md). Native
+    <title> on each bar gives a hover tooltip with no JS."""
+    if not items:
+        return '<div class="empty">Not enough data yet.</div>'
+    value_fmt = value_fmt or (lambda v: str(v))
+    n = len(items)
+    max_val = max((i[value_key] for i in items), default=0) or 1
+    pad_left, pad_right, pad_top, pad_bottom = 8, 8, 22, 26
+    plot_w = width - pad_left - pad_right
+    plot_h = height - pad_top - pad_bottom
+    slot_w = plot_w / n
+    bar_w = min(24.0, slot_w * 0.55)
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+        f'preserveAspectRatio="xMinYMin meet" role="img" aria-label="bar chart">'
+    ]
+    baseline_y = pad_top + plot_h
+    for idx, item in enumerate(items):
+        v = item[value_key]
+        bar_h = (v / max_val) * plot_h if max_val else 0
+        x = pad_left + idx * slot_w + (slot_w - bar_w) / 2
+        y = baseline_y - bar_h
+        r = min(4.0, bar_h / 2) if bar_h > 0 else 0
+        label = html.escape(str(item[label_key]))
+        title = f"{label}: {html.escape(value_fmt(v))}"
+        parts.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{max(bar_h, 1):.1f}" '
+            f'rx="{r:.1f}" ry="{r:.1f}" fill="{bar_color}"><title>{title}</title></rect>'
+        )
+        if show_values and v:
+            parts.append(
+                f'<text x="{x + bar_w / 2:.1f}" y="{y - 6:.1f}" text-anchor="middle" '
+                f'font-size="10" fill="{INK_SECONDARY}">{html.escape(value_fmt(v))}</text>'
+            )
+        if idx % label_every == 0:
+            parts.append(
+                f'<text x="{x + bar_w / 2:.1f}" y="{height - 8:.1f}" text-anchor="middle" '
+                f'font-size="10" fill="{INK_MUTED}">{label}</text>'
+            )
+    parts.append(
+        f'<line x1="{pad_left}" y1="{baseline_y:.1f}" x2="{width - pad_right}" y2="{baseline_y:.1f}" '
+        f'stroke="{BASELINE}" stroke-width="1"/>'
+    )
+    parts.append("</svg>")
+    return f'<div class="chart-wrap">{"".join(parts)}</div>'
+
+
+def _svg_hbar_chart(
+    items, *, value_key: str, label_key: str, width: int = 700, bar_h: int = 18, gap: int = 12,
+    bar_color: str = CHART_BLUE, value_fmt=None,
+) -> str:
+    """Horizontal bar chart -- for magnitude comparisons with longer text
+    labels (service names) that would collide as vertical-bar x-labels."""
+    if not items:
+        return '<div class="empty">Not enough data yet.</div>'
+    value_fmt = value_fmt or (lambda v: str(v))
+    max_val = max((i[value_key] for i in items), default=0) or 1
+    label_w = 150
+    right_pad = 48
+    plot_w = max(width - label_w - right_pad, 40)
+    height = len(items) * (bar_h + gap) + gap
+
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+        f'preserveAspectRatio="xMinYMin meet" role="img" aria-label="bar chart">'
+    ]
+    y = gap
+    for item in items:
+        v = item[value_key]
+        w = (v / max_val) * plot_w if max_val else 0
+        r = min(4.0, bar_h / 2)
+        label = html.escape(str(item[label_key]))
+        parts.append(
+            f'<text x="{label_w - 8}" y="{y + bar_h / 2 + 4:.1f}" text-anchor="end" '
+            f'font-size="12" fill="{INK_SECONDARY}">{label}</text>'
+        )
+        parts.append(
+            f'<rect x="{label_w}" y="{y}" width="{max(w, 2):.1f}" height="{bar_h}" '
+            f'rx="{r:.1f}" ry="{r:.1f}" fill="{bar_color}">'
+            f'<title>{label}: {html.escape(value_fmt(v))}</title></rect>'
+        )
+        parts.append(
+            f'<text x="{label_w + w + 8:.1f}" y="{y + bar_h / 2 + 4:.1f}" '
+            f'font-size="11" fill="{INK_SECONDARY}">{html.escape(value_fmt(v))}</text>'
+        )
+        y += bar_h + gap
+    parts.append("</svg>")
+    return f'<div class="chart-wrap">{"".join(parts)}</div>'
+
+
+def _svg_donut_chart(slices, *, size: int = 160, thickness: int = 26) -> str:
+    """slices: list of (label, value, color) tuples. A status color never
+    carries meaning alone -- each slice gets a legend row with a dot + the
+    label + the count + the percentage (the 'icon + label' pairing the
+    palette's status colors require)."""
+    total = sum(v for _, v, _ in slices if v)
+    if not total:
+        return '<div class="empty">Not enough data yet.</div>'
+
+    cx = cy = size / 2
+    r = (size - thickness) / 2
+    circumference = 2 * math.pi * r
+    offset = 0.0
+    arcs = []
+    legend_items = []
+    for label, value, color in slices:
+        if not value:
+            continue
+        frac = value / total
+        dash = circumference * frac
+        arcs.append(
+            f'<circle cx="{cx}" cy="{cy}" r="{r:.2f}" fill="none" stroke="{color}" stroke-width="{thickness}" '
+            f'stroke-dasharray="{dash:.2f} {circumference - dash:.2f}" stroke-dashoffset="{-offset:.2f}" '
+            f'transform="rotate(-90 {cx} {cy})"><title>{html.escape(label)}: {value} ({frac * 100:.0f}%)</title></circle>'
+        )
+        offset += dash
+        legend_items.append(
+            f'<div class="legend-item"><span class="legend-dot" style="background:{color}"></span>'
+            f'{html.escape(label)} — <b>{value}</b> ({frac * 100:.0f}%)</div>'
+        )
+
+    svg = (
+        f'<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}" role="img" aria-label="donut chart">'
+        + "".join(arcs)
+        + f'<text x="{cx}" y="{cy - 4}" text-anchor="middle" font-size="22" font-weight="700" fill="{INK_PRIMARY}">{total}</text>'
+        + f'<text x="{cx}" y="{cy + 14}" text-anchor="middle" font-size="10" fill="{INK_MUTED}">conversations</text>'
+        + "</svg>"
+    )
+    return f'<div class="donut-wrap"><div>{svg}</div><div class="legend">{"".join(legend_items)}</div></div>'
+
+
 def _render_page(clinic: dict, data: dict, days_param: int) -> str:
     kpis = data["kpis"]
+    filters = data.get("filters", {})
+    name_filter_val = filters.get("name", "")
+    month_filter_val = filters.get("month", "")
+    filter_qs = _filter_query_suffix(name_filter_val, month_filter_val)
 
     periods_html = ""
     for value, label in PERIOD_CHOICES:
         active = "active" if value == days_param else ""
-        periods_html += f'<a class="{active}" href="?days={value}">{html.escape(label)}</a>'
+        periods_html += f'<a class="{active}" href="?days={value}{filter_qs}">{html.escape(label)}</a>'
 
     kpi_cards = [
         (kpis["conversations"], "Conversations"),
@@ -178,11 +365,36 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
     else:
         today_html = '<div class="empty">No appointments scheduled for today.</div>'
 
+    # Filter bar -- controls the two lists below it (needs attention +
+    # recent conversations). A month_filter looks across that whole
+    # calendar month regardless of the days= period buttons above.
+    month_options = '<option value="">All months</option>' + "".join(
+        f'<option value="{html.escape(m["value"])}"{" selected" if m["value"] == month_filter_val else ""}>'
+        f'{html.escape(m["label"])}</option>'
+        for m in data.get("available_months", [])
+    )
+    clear_link = (
+        f'<a class="filter-clear" href="?days={days_param}">Clear filters</a>'
+        if (name_filter_val or month_filter_val) else ""
+    )
+    filter_bar_html = f"""
+  <div class="filter-bar">
+    <form method="get">
+      <input type="hidden" name="days" value="{days_param}">
+      <input type="text" name="name" placeholder="Search patient name…" value="{html.escape(name_filter_val)}">
+      <select name="month">{month_options}</select>
+      <button type="submit">Filter</button>
+      {clear_link}
+    </form>
+    <div class="filter-hint">Filters "Needs attention" and "Recent conversations" below. A month overrides the period buttons above for these two lists.</div>
+  </div>
+"""
+
     # Needs attention
     if data["needs_attention"]:
         items = ""
         for a in data["needs_attention"]:
-            conv_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{a["conversation_id"]}?days={days_param}'
+            conv_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{a["conversation_id"]}?days={days_param}{filter_qs}'
             items += (
                 f'<div class="attention-item"><b>{html.escape(a["patient_name"] or "Unknown")}</b> '
                 f'({html.escape(a["phone_number"] or "no number")}) — {_fmt_dt(a["started_at"])} '
@@ -190,6 +402,8 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
                 f'<div class="attention-reason">{html.escape(a["reason"] or "No reason given.")}</div></div>'
             )
         attention_html = items
+    elif name_filter_val or month_filter_val:
+        attention_html = '<div class="empty">Nothing flagged matches this filter.</div>'
     else:
         attention_html = '<div class="empty">Nothing flagged right now.</div>'
 
@@ -203,7 +417,7 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
                 booked_badge = '<span class="badge badge-yes">booked</span>'
             else:
                 booked_badge = '<span class="badge badge-no">no booking</span>'
-            conv_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{c["conversation_id"]}?days={days_param}'
+            conv_url = f'/clinic/{clinic["slug"]}/dashboard/conversation/{c["conversation_id"]}?days={days_param}{filter_qs}'
             rows += (
                 f'<tr><td>{_fmt_dt(c["started_at"])}</td>'
                 f'<td>{html.escape(c["patient_name"] or "Unknown")}</td>'
@@ -213,34 +427,44 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
                 f'<td><a class="view-link" href="{conv_url}">View</a></td></tr>'
             )
         recent_html = f'<table><tr><th>Started</th><th>Patient</th><th>WhatsApp</th><th>Messages</th><th>Outcome</th><th></th></tr>{rows}</table>'
+        if data.get("recent_conversations_truncated"):
+            recent_html += f'<div class="truncated-note">Showing the most recent {len(data["recent_conversations"])} matches — narrow the filter to see more precisely.</div>'
+    elif name_filter_val or month_filter_val:
+        recent_html = '<div class="empty">No conversations match this filter.</div>'
     else:
         recent_html = '<div class="empty">No conversations in this period.</div>'
 
-    # Top services
-    if data["top_services"]:
-        max_count = max(s["count"] for s in data["top_services"])
-        rows = ""
-        for s in data["top_services"]:
-            pct = int(s["count"] / max_count * 100) if max_count else 0
-            rows += (
-                f'<div class="bar-row"><div class="bar-hour" style="width:140px; text-align:left;">{html.escape(s["service_name"])}</div>'
-                f'<div class="bar-track"><div class="bar-fill" style="width:{pct}%"></div></div>'
-                f'<div class="bar-count">{s["count"]}</div></div>'
-            )
-        services_html = rows
-    else:
+    # Conversation outcomes -- donut
+    ob = data.get("outcome_breakdown", {})
+    outcomes_html = _svg_donut_chart([
+        ("Booked", ob.get("booked", 0), STATUS_GOOD),
+        ("Flagged for staff", ob.get("flagged", 0), STATUS_WARNING),
+        ("No booking", ob.get("no_booking", 0), STATUS_MUTED),
+    ])
+
+    # Conversations by month -- trend bar chart (fixed 6-month window)
+    trend_html = _svg_bar_chart(
+        data.get("monthly_trend", []), value_key="count", label_key="label", bar_color=CHART_BLUE,
+    )
+
+    # Top services -- horizontal bar chart
+    services_html = _svg_hbar_chart(
+        data["top_services"], value_key="count", label_key="service_name", bar_color=CHART_BLUE,
+    )
+    if not data["top_services"]:
         services_html = '<div class="empty">No service breakdown yet — this fills in as bookings come in with a service specified.</div>'
 
-    # Hourly distribution (message volume by hour of day)
-    max_hour = max((h["message_count"] for h in data["hourly_distribution"]), default=0)
-    hourly_rows = ""
-    for h in data["hourly_distribution"]:
-        pct = int(h["message_count"] / max_hour * 100) if max_hour else 0
-        hourly_rows += (
-            f'<div class="bar-row"><div class="bar-hour">{h["hour"]:02d}:00</div>'
-            f'<div class="bar-track"><div class="bar-fill" style="width:{pct}%"></div></div>'
-            f'<div class="bar-count">{h["message_count"]}</div></div>'
-        )
+    # Message volume by hour of day -- vertical bar chart, values hidden
+    # (24 direct labels would be clutter -- the hover tooltip has the
+    # exact count) and hour labels shown every 3 hours.
+    hourly_items = [
+        {"label": f'{h["hour"]:02d}', "message_count": h["message_count"]}
+        for h in data["hourly_distribution"]
+    ]
+    hourly_html = _svg_bar_chart(
+        hourly_items, value_key="message_count", label_key="label", width=900, height=160,
+        bar_color=CHART_BLUE, show_values=False, label_every=3,
+    )
 
     return f"""<!doctype html>
 <html>
@@ -258,10 +482,18 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
 
   <div class="kpi-grid">{kpi_html}</div>
 
+  <h2>Conversation outcomes</h2>
+  {outcomes_html}
+
+  <h2>Conversations by month</h2>
+  {trend_html}
+
   <h2>Today's schedule</h2>
   {today_html}
 
-  <h2>Needs attention ({kpis['flagged_conversations']})</h2>
+  {filter_bar_html}
+
+  <h2>Needs attention ({len(data['needs_attention'])})</h2>
   {attention_html}
 
   <h2>Recent conversations</h2>
@@ -271,7 +503,7 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
   {services_html}
 
   <h2>Message volume by hour of day</h2>
-  {hourly_rows}
+  {hourly_html}
 
   <div class="api-hint">
     Want this data in your own system? The same numbers are available as JSON at
@@ -281,8 +513,11 @@ def _render_page(clinic: dict, data: dict, days_param: int) -> str:
 </html>"""
 
 
-def _render_conversation_page(clinic: dict, conversation, patient, messages: list, booked: bool, days_param: int) -> str:
-    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}'
+def _render_conversation_page(
+    clinic: dict, conversation, patient, messages: list, booked: bool, days_param: int,
+    name_filter: str = "", month_filter: str = "",
+) -> str:
+    back_url = f'/clinic/{clinic["slug"]}/dashboard?days={days_param}{_filter_query_suffix(name_filter, month_filter)}'
 
     if conversation.flagged_for_staff:
         flag_banner = (
@@ -339,7 +574,9 @@ def _render_conversation_page(clinic: dict, conversation, patient, messages: lis
 
 @router.get("/clinic/{slug}/dashboard/conversation/{conversation_id}", response_class=HTMLResponse)
 async def clinic_dashboard_conversation(
-    slug: str, conversation_id: int, days: int = Query(7), credentials: HTTPBasicCredentials = Depends(security)
+    slug: str, conversation_id: int, days: int = Query(7),
+    name: Optional[str] = Query(None), month: Optional[str] = Query(None),
+    credentials: HTTPBasicCredentials = Depends(security),
 ):
     clinic = _get_clinic_or_404(slug)
     require_dashboard_auth(clinic, credentials)
@@ -370,26 +607,36 @@ async def clinic_dashboard_conversation(
             ).fetchone()
             booked = booked_row is not None
 
-    return HTMLResponse(_render_conversation_page(clinic, conversation, patient, messages, booked, days))
+    return HTMLResponse(_render_conversation_page(
+        clinic, conversation, patient, messages, booked, days, name or "", month or "",
+    ))
 
 
 @router.get("/clinic/{slug}/dashboard", response_class=HTMLResponse)
-async def clinic_dashboard(slug: str, days: int = Query(7), credentials: HTTPBasicCredentials = Depends(security)):
+async def clinic_dashboard(
+    slug: str, days: int = Query(7),
+    name: Optional[str] = Query(None), month: Optional[str] = Query(None),
+    credentials: HTTPBasicCredentials = Depends(security),
+):
     clinic = _get_clinic_or_404(slug)
     require_dashboard_auth(clinic, credentials)
 
     db.set_current_db_path(clinic["db_path"])
-    data = analytics.get_dashboard_summary(days=_days_param(days))
+    data = analytics.get_dashboard_summary(days=_days_param(days), name_filter=name, month_filter=month)
     return HTMLResponse(_render_page(clinic, data, days))
 
 
 @router.get("/clinic/{slug}/api/dashboard")
-async def clinic_dashboard_api(slug: str, days: int = Query(7), credentials: HTTPBasicCredentials = Depends(security)):
+async def clinic_dashboard_api(
+    slug: str, days: int = Query(7),
+    name: Optional[str] = Query(None), month: Optional[str] = Query(None),
+    credentials: HTTPBasicCredentials = Depends(security),
+):
     clinic = _get_clinic_or_404(slug)
     require_dashboard_auth(clinic, credentials)
 
     db.set_current_db_path(clinic["db_path"])
-    data = analytics.get_dashboard_summary(days=_days_param(days))
+    data = analytics.get_dashboard_summary(days=_days_param(days), name_filter=name, month_filter=month)
     return {
         "clinic": {"name": clinic["name"], "slug": clinic["slug"]},
         **data,
