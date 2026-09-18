@@ -23,6 +23,7 @@ import re
 import json
 import shutil
 import sqlite3
+import secrets
 import logging
 from contextlib import contextmanager
 from datetime import datetime
@@ -88,6 +89,8 @@ CREATE TABLE IF NOT EXISTS clinics (
     subscription_plan TEXT NOT NULL DEFAULT 'trial',
     subscription_started_at TEXT NOT NULL,
 
+    dashboard_password TEXT,
+
     db_path TEXT NOT NULL,
     config_path TEXT NOT NULL,
     static_dir TEXT NOT NULL,
@@ -102,6 +105,14 @@ def init_control_db():
     os.makedirs(DATA_ROOT, exist_ok=True)
     with _db() as conn:
         conn.executescript(SCHEMA_SQL)
+
+        # Migration for control.db files created before dashboard_password
+        # existed (see the staff dashboard, app/dashboard.py). Same
+        # guarded-ALTER-TABLE pattern used in shared/db.py's init_db.
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(clinics)")}
+        if "dashboard_password" not in existing_columns:
+            conn.execute("ALTER TABLE clinics ADD COLUMN dashboard_password TEXT")
+            logger.info("Migrated clinics table: added dashboard_password column.")
 
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -146,6 +157,31 @@ def get_clinic_by_phone_number_id(phone_number_id: str) -> Optional[Dict[str, An
             "SELECT * FROM clinics WHERE whatsapp_phone_number_id=?", (phone_number_id,)
         ).fetchone()
         return _row_to_dict(row) if row else None
+
+
+def get_clinic_by_slug(slug: str) -> Optional[Dict[str, Any]]:
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM clinics WHERE slug=?", (slug,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+
+def ensure_dashboard_password(clinic_id: int) -> Optional[str]:
+    """Returns this clinic's staff-dashboard password, generating and saving
+    one on the spot if it doesn't have one yet. Covers clinics added before
+    the staff dashboard (app/dashboard.py) existed -- so every existing
+    clinic gets one automatically the first time it's looked up, with no
+    manual admin action needed. Returns None only if clinic_id doesn't
+    exist."""
+    clinic = get_clinic(clinic_id)
+    if not clinic:
+        return None
+    if clinic.get("dashboard_password"):
+        return clinic["dashboard_password"]
+    password = secrets.token_urlsafe(9)  # ~72 bits -- short enough to read out loud at a front desk
+    with _db() as conn:
+        conn.execute("UPDATE clinics SET dashboard_password=? WHERE id=?", (password, clinic_id))
+    logger.info("Generated a new dashboard password for clinic id=%s", clinic_id)
+    return password
 
 
 def write_clinic_config_yaml(clinic: Dict[str, Any]):
@@ -200,6 +236,7 @@ def add_clinic(
     and slug)."""
     init_control_db()
     started_at = subscription_started_at or datetime.now().strftime("%Y-%m-%d")
+    dashboard_password = secrets.token_urlsafe(9)  # ~72 bits -- short enough to read out loud at a front desk
 
     with _db() as conn:
         slug = _unique_slug(conn, slugify(name))
@@ -218,9 +255,9 @@ def add_clinic(
                 general_hours, parking, phone, address, google_maps_link,
                 offers_text, offers_image_filename,
                 holidays_json, services_json, dentists_json,
-                subscription_plan, subscription_started_at,
+                subscription_plan, subscription_started_at, dashboard_password,
                 db_path, config_path, static_dir, created_at
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 slug, name,
@@ -228,7 +265,7 @@ def add_clinic(
                 general_hours, parking, phone, address, google_maps_link,
                 offers_text, offers_image_filename,
                 json.dumps(holidays or []), json.dumps(services or []), json.dumps(dentists or []),
-                subscription_plan, started_at,
+                subscription_plan, started_at, dashboard_password,
                 db_path, config_path, static_dir, datetime.now().isoformat(),
             ),
         )

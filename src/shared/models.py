@@ -26,6 +26,12 @@ class Patient(BaseModel):
     age: Optional[int] = None
     gender: Optional[str] = Field(default=None, description="Male/Female/Other")
     phone_number: str
+    created_at: Optional[datetime] = Field(
+        default=None,
+        description="When this patient/contact first messaged the clinic. Set automatically by db.create_patient "
+                     "if left blank. Used by the staff dashboard to count new patients per period -- rows from "
+                     "before this field existed have this as NULL and are excluded from period-based new-patient counts.",
+    )
 
 
 # -----------------------
@@ -37,6 +43,26 @@ class Appointment(BaseModel):
     dentist_id: int
     appointment_time: datetime
     status: str = Field(default="scheduled", description="scheduled/cancelled/completed/rescheduled")
+    created_at: Optional[datetime] = Field(
+        default=None,
+        description="When this appointment was BOOKED (not the appointment_time itself, which is the future slot). "
+                     "Set automatically by db.create_appointment if left blank. Used by the staff dashboard for "
+                     "'bookings this week' style reporting -- rows from before this field existed have this as "
+                     "NULL and are excluded from period-based booking counts.",
+    )
+    service_name: Optional[str] = Field(
+        default=None,
+        description="The clinic service this appointment is for, matched against the clinic's configured services "
+                     "list (see clinic_config.get_services()) when possible. Optional -- Sia passes this when the "
+                     "patient specified a service; older bookings and any booking without a clear service match "
+                     "leave this NULL. Powers the 'most requested services' dashboard insight.",
+    )
+    price_sar: Optional[float] = Field(
+        default=None,
+        description="The service's price in SAR at the time of booking, looked up from the clinic's services list "
+                     "by service_name. Used for the dashboard's estimated-revenue-booked figure -- an estimate of "
+                     "pipeline value, not confirmed/collected revenue.",
+    )
 
 
 # -----------------------
@@ -72,6 +98,8 @@ class AppointmentWithDetails(BaseModel):
     status: str
     dentist_name: str
     patient_name: str
+    service_name: Optional[str] = None
+    price_sar: Optional[float] = None
 
 
 class DentistListResponse(BaseModel):

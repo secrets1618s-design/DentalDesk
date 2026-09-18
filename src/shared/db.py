@@ -78,12 +78,14 @@ def get_dentist(dentist_id: int) -> Optional[Dentist]:
 # Patient Queries
 # -----------------------
 def create_patient(patient: Patient) -> Patient:
+    created_at = patient.created_at or datetime.now()
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO patients (name, age, gender, phone_number) VALUES (?, ?, ?, ?)",
-            (patient.name, patient.age, patient.gender, patient.phone_number),
+            "INSERT INTO patients (name, age, gender, phone_number, created_at) VALUES (?, ?, ?, ?, ?)",
+            (patient.name, patient.age, patient.gender, patient.phone_number, created_at.isoformat()),
         )
         patient.id = cur.lastrowid
+        patient.created_at = created_at
         logger.info("Patient created with id=%s", patient.id)
         return patient
 
@@ -104,12 +106,20 @@ def get_patient_by_phone(phone_number: str) -> Optional[Patient]:
 # Appointment Queries
 # -----------------------
 def create_appointment(appt: Appointment) -> Appointment:
+    created_at = appt.created_at or datetime.now()
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO appointments (patient_id, dentist_id, appointment_time, status) VALUES (?, ?, ?, ?)",
-            (appt.patient_id, appt.dentist_id, appt.appointment_time.isoformat(), appt.status),
+            """
+            INSERT INTO appointments (patient_id, dentist_id, appointment_time, status, created_at, service_name, price_sar)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                appt.patient_id, appt.dentist_id, appt.appointment_time.isoformat(), appt.status,
+                created_at.isoformat(), appt.service_name, appt.price_sar,
+            ),
         )
         appt.id = cur.lastrowid
+        appt.created_at = created_at
         logger.info("Appointment created with id=%s", appt.id)
         return appt
 
@@ -128,12 +138,14 @@ def get_patient_appointments(patient_id: int) -> List[AppointmentWithDetails]:
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT 
+            SELECT
                 a.id as appointment_id,
                 a.appointment_time,
                 a.status,
                 d.name as dentist_name,
-                p.name as patient_name
+                p.name as patient_name,
+                a.service_name,
+                a.price_sar
             FROM appointments a
             JOIN dentists d ON a.dentist_id = d.id
             JOIN patients p ON a.patient_id = p.id
@@ -321,7 +333,8 @@ CREATE TABLE IF NOT EXISTS patients (
     name TEXT NOT NULL,
     age INTEGER,
     gender TEXT,
-    phone_number TEXT NOT NULL
+    phone_number TEXT NOT NULL,
+    created_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS appointments (
@@ -330,6 +343,9 @@ CREATE TABLE IF NOT EXISTS appointments (
     dentist_id INTEGER NOT NULL,
     appointment_time TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'scheduled',
+    created_at TEXT,
+    service_name TEXT,
+    price_sar REAL,
     FOREIGN KEY(patient_id) REFERENCES patients(id),
     FOREIGN KEY(dentist_id) REFERENCES dentists(id)
 );
@@ -396,6 +412,29 @@ def init_db(seed: bool = True, dentists: Optional[list] = None):
         if "nationality" not in existing_dentist_columns:
             conn.execute("ALTER TABLE dentists ADD COLUMN nationality TEXT")
             logger.info("Migrated dentists table: added nationality column.")
+
+        # Same idea for patients.created_at (added for the staff dashboard's
+        # "new patients" reporting -- see shared/analytics.py). Existing rows
+        # get NULL here since we genuinely don't know when they first
+        # messaged; the dashboard excludes NULLs from period-based counts
+        # rather than guessing.
+        existing_patient_columns = {row["name"] for row in conn.execute("PRAGMA table_info(patients)")}
+        if "created_at" not in existing_patient_columns:
+            conn.execute("ALTER TABLE patients ADD COLUMN created_at TEXT")
+            logger.info("Migrated patients table: added created_at column.")
+
+        # Same idea for appointments.created_at/service_name/price_sar (also
+        # added for the staff dashboard -- see shared/analytics.py).
+        existing_appt_columns = {row["name"] for row in conn.execute("PRAGMA table_info(appointments)")}
+        if "created_at" not in existing_appt_columns:
+            conn.execute("ALTER TABLE appointments ADD COLUMN created_at TEXT")
+            logger.info("Migrated appointments table: added created_at column.")
+        if "service_name" not in existing_appt_columns:
+            conn.execute("ALTER TABLE appointments ADD COLUMN service_name TEXT")
+            logger.info("Migrated appointments table: added service_name column.")
+        if "price_sar" not in existing_appt_columns:
+            conn.execute("ALTER TABLE appointments ADD COLUMN price_sar REAL")
+            logger.info("Migrated appointments table: added price_sar column.")
 
         if seed:
             existing = conn.execute("SELECT COUNT(*) FROM dentists").fetchone()[0]

@@ -40,6 +40,12 @@ class BookAppointmentPayload(BaseModel):
     patient_name: Optional[str] = Field(None, description="The patient's full name (required if the patient is new).")
     patient_age: Optional[int] = Field(None, description="The patient's age (optional, for new patients).")
     patient_gender: Optional[str] = Field(None, description="The patient's gender (optional, for new patients).")
+    service_name: Optional[str] = Field(
+        None,
+        description="The service this appointment is for, if the patient specified one (e.g. 'Teeth Cleaning'). "
+                    "Match it to one of the names from get_clinic_info's services list when you can -- this powers "
+                    "the clinic's 'most requested services' reporting. Leave blank if the patient didn't say.",
+    )
 
 
 class CancelAppointmentPayload(BaseModel):
@@ -165,6 +171,10 @@ BASE_SYSTEM_PROMPT = ("You are a helpful dental assistant. Your name is 'Sia'. Y
                     "VERY IMPORTANT: Before booking, cancelling, or rescheduling any appointment, you MUST call the `get_current_time` "
                     "tool to know the current date and time. All appointments must be scheduled for a future time relative to the current time. "
                     "Do not book, cancel or reschedule appointments in the past.\n\n"
+                    "When booking, if the patient mentioned which service/treatment they want (e.g. 'teeth cleaning', "
+                    "'a checkup'), pass it as `service_name` in `book_appointment`, matching the exact name from "
+                    "`get_clinic_info`'s services list where possible. This is only for the clinic's own records — "
+                    "never refuse or delay a booking just because the patient didn't specify a service.\n\n"
                     "HIJRI DATES — if a patient gives you a date in the Hijri (Islamic) calendar (e.g. 'the 1st of Ramadan' "
                     "or '10 Shawwal 1448') and you need the real calendar date to check availability or book/reschedule/cancel "
                     "something, use the `convert_hijri_to_gregorian` tool — never estimate this yourself. Likewise, if a patient "
@@ -499,11 +509,34 @@ def book_appointment(payload: BookAppointmentPayload) -> Dict[str, Any]:
             if clash:
                 return {"error": "slot_unavailable", "details": "The requested time slot is already booked."}
 
+            # Best-effort match of the freeform service_name the agent passed
+            # against this clinic's configured services list, so we store the
+            # clinic's own canonical name/price rather than whatever casing or
+            # phrasing the agent used -- this is what keeps "most requested
+            # services" reporting clean instead of splitting "Cleaning" and
+            # "teeth cleaning" into two separate buckets. No match (or no
+            # service_name given) just leaves both fields NULL -- never a
+            # reason to fail the booking itself.
+            matched_service_name, matched_price = None, None
+            if payload.service_name:
+                for svc in clinic_config.get_services():
+                    if str(svc.get("name", "")).strip().lower() == payload.service_name.strip().lower():
+                        matched_service_name = svc.get("name")
+                        # price_sar in clinic_config.yaml is free text (a non-developer edits it), so it isn't
+                        # guaranteed numeric (e.g. "Contact us for pricing") -- only store it if it actually is.
+                        try:
+                            matched_price = float(svc.get("price_sar"))
+                        except (TypeError, ValueError):
+                            matched_price = None
+                        break
+
             new_appointment = Appointment(
                 patient_id=patient.id,
                 dentist_id=payload.dentist_id,
                 appointment_time=datetime.fromisoformat(payload.appointment_time),
-                status='scheduled'
+                status='scheduled',
+                service_name=matched_service_name,
+                price_sar=matched_price,
             )
             created_appt = shared_db.create_appointment(new_appointment)
 

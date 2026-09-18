@@ -183,6 +183,10 @@ def _render_page(message_html: str = "") -> str:
                 <td>{html.escape(c['subscription_plan'])} (since {html.escape(c['subscription_started_at'])})</td>
                 <td class="{'badge-active' if c['active'] else 'badge-inactive'}">{'active' if c['active'] else 'inactive'}</td>
                 <td>
+                    <a href="/clinic/{c['slug']}/dashboard" target="_blank">Open</a><br>
+                    <span class="hint">user: {html.escape(c['slug'])}<br>pass: {html.escape(c.get('dashboard_password') or clinics_store.ensure_dashboard_password(c['id']) or '')}</span>
+                </td>
+                <td>
                     <form class="delete-form" method="post" action="/admin/clinics/{c['id']}/delete"
                           onsubmit="return confirm('Remove this clinic? This stops its WhatsApp number from replying and deletes its data (patients, appointments, config) from this app. This cannot be undone here -- you will still need to revoke its access token in Meta separately.');">
                         <button type="submit" class="delete-btn">Delete</button>
@@ -190,7 +194,7 @@ def _render_page(message_html: str = "") -> str:
                 </td>
             </tr>"""
     else:
-        rows = "<tr><td colspan=6>No clinics yet -- add the first one below.</td></tr>"
+        rows = "<tr><td colspan=7>No clinics yet -- add the first one below.</td></tr>"
 
     plan_options = "".join(
         f'<option value="{p}">{p.replace("_", " ")}</option>' for p in SUBSCRIPTION_PLAN_CHOICES
@@ -206,7 +210,7 @@ def _render_page(message_html: str = "") -> str:
 
   <h2>Current clinics</h2>
   <table>
-    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Status</th><th></th></tr>
+    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Status</th><th>Staff dashboard</th><th></th></tr>
     {rows}
   </table>
 
@@ -384,10 +388,16 @@ async def admin_add_clinic(
 
     launch_clinic_worker(clinic)
 
+    dashboard_note = (
+        f'Staff dashboard: <a href="/clinic/{clinic["slug"]}/dashboard" target="_blank">/clinic/{clinic["slug"]}/dashboard</a> '
+        f'-- login user: <b>{clinic["slug"]}</b>, password: <b>{html.escape(clinic["dashboard_password"])}</b> '
+        f'(give these to this clinic\'s reception; also always visible in the table above).'
+    )
+
     if subscribe_result["ok"]:
         message = (
             f'<div class="flash-ok">✅ {html.escape(clinic["name"])} was added and is now LIVE on this service '
-            f'-- its WhatsApp number will start replying immediately. No restart or redeploy needed.</div>'
+            f'-- its WhatsApp number will start replying immediately. No restart or redeploy needed.<br><br>{dashboard_note}</div>'
         )
     else:
         message = (
@@ -396,7 +406,7 @@ async def admin_add_clinic(
             f"wrong, or the token doesn't have the whatsapp_business_management permission on it):\n"
             f"{html.escape(str(subscribe_result['body']))}\n\n"
             f"Fix the token/WABA ID and re-subscribe manually (see check_subscription.py), or remove and re-add "
-            f"this clinic once you have the right credentials.</div>"
+            f"this clinic once you have the right credentials.<br><br>{dashboard_note}</div>"
         )
 
     return HTMLResponse(_render_page(message))
