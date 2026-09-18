@@ -37,7 +37,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from shared import clinics_store
-from app.clinic_registry import launch_clinic_worker
+from app.clinic_registry import launch_clinic_worker, stop_clinic_worker
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +162,9 @@ PAGE_STYLE = """
   .flash-err { background: #ffeef0; border: 1px solid #cf222e; padding: 10px; border-radius: 4px; margin-top: 12px; white-space: pre-wrap; }
   .badge-active { color: #1a7f37; font-weight: 600; }
   .badge-inactive { color: #999; }
+  .delete-form { margin: 0; }
+  .delete-btn { margin: 0; padding: 5px 12px; font-size: 12px; background: #cf222e; }
+  .delete-btn:hover { background: #a40e24; }
 </style>
 """
 
@@ -179,9 +182,15 @@ def _render_page(message_html: str = "") -> str:
                 <td>{html.escape(c['whatsapp_phone_number_id'])}</td>
                 <td>{html.escape(c['subscription_plan'])} (since {html.escape(c['subscription_started_at'])})</td>
                 <td class="{'badge-active' if c['active'] else 'badge-inactive'}">{'active' if c['active'] else 'inactive'}</td>
+                <td>
+                    <form class="delete-form" method="post" action="/admin/clinics/{c['id']}/delete"
+                          onsubmit="return confirm('Remove this clinic? This stops its WhatsApp number from replying and deletes its data (patients, appointments, config) from this app. This cannot be undone here -- you will still need to revoke its access token in Meta separately.');">
+                        <button type="submit" class="delete-btn">Delete</button>
+                    </form>
+                </td>
             </tr>"""
     else:
-        rows = "<tr><td colspan=5>No clinics yet -- add the first one below.</td></tr>"
+        rows = "<tr><td colspan=6>No clinics yet -- add the first one below.</td></tr>"
 
     plan_options = "".join(
         f'<option value="{p}">{p.replace("_", " ")}</option>' for p in SUBSCRIPTION_PLAN_CHOICES
@@ -197,7 +206,7 @@ def _render_page(message_html: str = "") -> str:
 
   <h2>Current clinics</h2>
   <table>
-    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Status</th></tr>
+    <tr><th>Name</th><th>Slug</th><th>WhatsApp Phone Number ID</th><th>Subscription</th><th>Status</th><th></th></tr>
     {rows}
   </table>
 
@@ -390,4 +399,23 @@ async def admin_add_clinic(
             f"this clinic once you have the right credentials.</div>"
         )
 
+    return HTMLResponse(_render_page(message))
+
+
+@router.post("/admin/clinics/{clinic_id}/delete", response_class=HTMLResponse)
+async def admin_delete_clinic(clinic_id: int, _: bool = Depends(require_admin)):
+    clinic = clinics_store.get_clinic(clinic_id)
+    if not clinic:
+        message = '<div class="flash-err">No clinic with that id (maybe already removed?). Nothing changed.</div>'
+        return HTMLResponse(_render_page(message))
+
+    stop_clinic_worker(clinic_id)
+    clinics_store.remove_clinic(clinic_id)
+
+    message = (
+        f'<div class="flash-ok">🗑️ {html.escape(clinic["name"])} was removed from this app -- its worker was '
+        f"stopped and its data (patients, appointments, config) was deleted. Its WhatsApp access token and phone "
+        f"number are untouched on Meta's side -- revoke/disconnect those yourself in Meta's Business Settings if "
+        f"this clinic is gone for good (see claude/how-to-add-remove-clinic-whatsapp-number.md).</div>"
+    )
     return HTMLResponse(_render_page(message))

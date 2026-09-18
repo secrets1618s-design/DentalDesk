@@ -127,6 +127,8 @@ dependencies = [
     { name = "langgraph" },
     { name = "mcp" },
     { name = "pydantic" },
+    { name = "python-multipart" },
+    { name = "pyyaml" },
     { name = "requests" },
     { name = "uvicorn" },
 ]
@@ -142,6 +144,8 @@ requires-dist = [
     { name = "langgraph", specifier = ">=0.6.6" },
     { name = "mcp", specifier = ">=1.13.1" },
     { name = "pydantic", specifier = ">=2.11.7" },
+    { name = "python-multipart", specifier = ">=0.0.9" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.32.4" },
     { name = "uvicorn", specifier = ">=0.35.0" },
 ]

@@ -21,6 +21,7 @@ leak into another clinic's, because they are physically different files.
 import os
 import re
 import json
+import shutil
 import sqlite3
 import logging
 from contextlib import contextmanager
@@ -247,6 +248,42 @@ def update_offers_image_filename(clinic_id: int, filename: str):
 def set_clinic_active(clinic_id: int, active: bool):
     with _db() as conn:
         conn.execute("UPDATE clinics SET active=? WHERE id=?", (1 if active else 0, clinic_id))
+
+
+def remove_clinic(clinic_id: int) -> Optional[Dict[str, Any]]:
+    """Permanently removes a clinic from this app: deletes its row from the
+    clinics table and deletes its entire per-clinic data folder (database,
+    config, uploaded brochure image) under data/clinics/<slug>/.
+
+    Returns the clinic record as it was right before deletion (so the
+    caller can show/log its name), or None if no clinic with this id
+    exists.
+
+    This is the "in the app" half of removing a clinic only -- it does NOT
+    touch anything on Meta's side. The WhatsApp access token stays valid
+    there until you revoke it yourself in Meta's Business Settings, and
+    the phone number stays registered until disconnected there. See
+    claude/how-to-add-remove-clinic-whatsapp-number.md for those steps.
+    """
+    clinic = get_clinic(clinic_id)
+    if not clinic:
+        return None
+
+    with _db() as conn:
+        conn.execute("DELETE FROM clinics WHERE id=?", (clinic_id,))
+
+    # Only ever delete folders inside DATA_ROOT -- this protects the one
+    # clinic that may still be pointed at the LEGACY_* paths (the clinic
+    # carried over automatically from the old single-clinic deployment),
+    # whose db/config/static files live outside DATA_ROOT and are not
+    # this clinic's own private folder to delete.
+    clinic_dir = os.path.abspath(os.path.join(DATA_ROOT, clinic["slug"]))
+    data_root_abs = os.path.abspath(DATA_ROOT)
+    if os.path.commonpath([clinic_dir, data_root_abs]) == data_root_abs and os.path.isdir(clinic_dir):
+        shutil.rmtree(clinic_dir, ignore_errors=True)
+
+    logger.info("Removed clinic id=%s slug=%s name=%r", clinic_id, clinic["slug"], clinic["name"])
+    return clinic
 
 
 def update_subscription(clinic_id: int, plan: str, started_at: Optional[str] = None):
