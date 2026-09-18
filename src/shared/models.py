@@ -75,6 +75,12 @@ class Conversation(BaseModel):
     started_at: datetime = Field(default_factory=datetime.utcnow)
     ended_at: Optional[datetime] = None
     closed_reason: Optional[str] = None
+    flagged_for_staff: bool = Field(
+        default=False, description="Set by shared.db.flag_conversation() when Sia calls flag_for_staff."
+    )
+    flag_reason: Optional[str] = Field(
+        default=None, description="Why this conversation was flagged -- see flagged_for_staff."
+    )
 
 
 # -----------------------
