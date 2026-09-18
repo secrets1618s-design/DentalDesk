@@ -83,6 +83,7 @@ def get_dashboard_summary(
     name_filter: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    schedule_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Builds everything the staff dashboard shows, in one call: top-line KPIs,
@@ -110,12 +111,18 @@ def get_dashboard_summary(
     the dashboard grows, rather than one query trying to do everything at
     once. Clinic-scale data (dozens to low hundreds of conversations per
     period) makes this a non-issue performance-wise.
+
+    schedule_date ("YYYY-MM-DD", optional) picks which single day's
+    appointments the schedule section shows -- defaults to today when
+    absent/malformed. Independent of every other filter on this page: it's
+    a "what does tomorrow look like" lookup, not a report window.
     """
     cutoff = _period_cutoff(days)
     name_filter_norm = (name_filter or "").strip().lower() or None
     from_dt = _parse_date(date_from)
     to_dt = _parse_date(date_to)
     has_date_range = bool(from_dt or to_dt)
+    schedule_dt = _parse_date(schedule_date) or datetime.now()
 
     with db() as conn:
         # ---- Conversations in period (KPI + insight-chart scope) ----
@@ -178,23 +185,27 @@ def get_dashboard_summary(
                     pass
         avg_messages = (sum(message_count_by_conv.values()) / len(conv_ids)) if conv_ids else 0.0
 
-        # ---- Today's schedule -- always "today" regardless of the period
-        # filter above; this is the live front-desk view, not a report. ----
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        today_end = datetime.now().replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
-        today_rows = conn.execute(
+        # ---- Schedule for schedule_dt (defaults to today) -- a specific
+        # day's live front-desk view, not a period report; independent of
+        # the days= selector and the name/date-range list filters. Includes
+        # the patient's age/gender alongside name/phone so reception can
+        # see who's coming in without opening each conversation. ----
+        schedule_start = schedule_dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        schedule_end = schedule_dt.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+        schedule_rows = conn.execute(
             """
             SELECT a.id, a.appointment_time, a.status, a.service_name, a.price_sar,
-                   d.name as dentist_name, p.name as patient_name, p.phone_number
+                   d.name as dentist_name, p.name as patient_name, p.phone_number,
+                   p.age as patient_age, p.gender as patient_gender
             FROM appointments a
             JOIN dentists d ON d.id = a.dentist_id
             JOIN patients p ON p.id = a.patient_id
             WHERE a.appointment_time >= ? AND a.appointment_time <= ? AND a.status != 'cancelled'
             ORDER BY a.appointment_time
             """,
-            (today_start, today_end),
+            (schedule_start, schedule_end),
         ).fetchall()
-        today_appointments = [dict(r) for r in today_rows]
+        schedule_appointments = [dict(r) for r in schedule_rows]
 
         # ---- Conversation outcomes -- booked / flagged / no booking, over
         # the FULL period (not capped), for the donut chart. Mirrors the
@@ -279,23 +290,35 @@ def get_dashboard_summary(
             ).fetchall():
                 list_message_count_by_conv[row["conversation_id"]] = row["cnt"]
 
-        def _patient_name_and_phone(patient_id):
+        def _patient_lookup(patient_id):
+            """Returns name/phone/age/gender for a patient, so both the
+            needs-attention and recent-conversations lists can show who's
+            coming in (age/gender) without a separate query per row."""
             if patient_id is None:
-                return "Unknown", None
-            row = conn.execute("SELECT name, phone_number FROM patients WHERE id=?", (patient_id,)).fetchone()
+                return {"name": "Unknown", "phone_number": None, "age": None, "gender": None}
+            row = conn.execute(
+                "SELECT name, phone_number, age, gender FROM patients WHERE id=?", (patient_id,)
+            ).fetchone()
             if not row:
-                return "Unknown", None
-            return row["name"] or "Unknown", row["phone_number"]
+                return {"name": "Unknown", "phone_number": None, "age": None, "gender": None}
+            return {
+                "name": row["name"] or "Unknown",
+                "phone_number": row["phone_number"],
+                "age": row["age"],
+                "gender": row["gender"],
+            }
 
         needs_attention = []
         for c in [c for c in list_conversations if c["flagged_for_staff"]]:
-            pname, pphone = _patient_name_and_phone(c["patient_id"])
-            if name_filter_norm and name_filter_norm not in pname.lower():
+            patient = _patient_lookup(c["patient_id"])
+            if name_filter_norm and name_filter_norm not in patient["name"].lower():
                 continue
             needs_attention.append({
                 "conversation_id": c["id"],
-                "patient_name": pname,
-                "phone_number": pphone,
+                "patient_name": patient["name"],
+                "phone_number": patient["phone_number"],
+                "patient_age": patient["age"],
+                "patient_gender": patient["gender"],
                 "reason": c["flag_reason"],
                 "started_at": c["started_at"],
                 "status": c["status"],
@@ -305,8 +328,8 @@ def get_dashboard_summary(
         recent_conversations = []
         recent_truncated = False
         for c in list_conversations:
-            pname, pphone = _patient_name_and_phone(c["patient_id"])
-            if name_filter_norm and name_filter_norm not in pname.lower():
+            patient = _patient_lookup(c["patient_id"])
+            if name_filter_norm and name_filter_norm not in patient["name"].lower():
                 continue
             if len(recent_conversations) >= RECENT_CONVERSATIONS_CAP:
                 recent_truncated = True
@@ -314,8 +337,10 @@ def get_dashboard_summary(
             booked = _booked_during(conn, c["patient_id"], c["started_at"], c["ended_at"])
             recent_conversations.append({
                 "conversation_id": c["id"],
-                "patient_name": pname,
-                "phone_number": pphone,
+                "patient_name": patient["name"],
+                "phone_number": patient["phone_number"],
+                "patient_age": patient["age"],
+                "patient_gender": patient["gender"],
                 "started_at": c["started_at"],
                 "ended_at": c["ended_at"],
                 "status": c["status"],
@@ -355,7 +380,8 @@ def get_dashboard_summary(
             "avg_messages_per_conversation": round(avg_messages, 1),
             "estimated_revenue_booked_sar": estimated_revenue,
         },
-        "today_appointments": today_appointments,
+        "schedule_date": schedule_dt.strftime("%Y-%m-%d"),
+        "schedule_appointments": schedule_appointments,
         "needs_attention": needs_attention,
         "recent_conversations": recent_conversations,
         "recent_conversations_truncated": recent_truncated,
@@ -371,5 +397,6 @@ def get_dashboard_summary(
             "name": name_filter or "",
             "from": date_from if from_dt else "",
             "to": date_to if to_dt else "",
+            "schedule_date": schedule_dt.strftime("%Y-%m-%d"),
         },
     }
